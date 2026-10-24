@@ -1,0 +1,55 @@
+menu "Quacktion"
+
+    config QUACK_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+        help
+            Development fallback. Leave empty in committed configs.
+
+    config QUACK_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+        help
+            Development fallback. Leave empty in committed configs.
+
+    config QUACK_BACKEND_URL
+        string "Backend base URL"
+        default ""
+        help
+            Base URL of the Quacktion backend, for example https://api.example.com.
+            Plain http is for local development only.
+
+    config QUACK_DEVICE_ID
+        string "Device ID"
+        default ""
+        help
+            Backend-assigned device ID. Development fallback.
+
+    config QUACK_DEVICE_CREDENTIAL
+        string "Device credential"
+        default ""
+        help
+            Device credential returned by pairing. Development fallback.
+            Never commit a real value.
+
+    config QUACK_SESSION_IDLE_SECONDS
+        int "End a conversation after this many seconds of quiet"
+        default 10
+        range 3 120
+        help
+            The session ends when nobody has spoken and no reply has played for this long.
+
+    config QUACK_SPEECH_MIN_DB
+        int "Minimum speech level that keeps a conversation open (dBFS)"
+        default -42
+        range -70 0
+        help
+            Speech quieter than this, such as people talking further away, does not count as
+            someone talking to the duck.
+
+    config QUACK_SESSION_MAX_SECONDS
+        int "Maximum conversation length in seconds"
+        default 300
+        range 30 3600
+
+endmenu

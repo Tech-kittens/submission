@@ -1,0 +1,119 @@
+{
+  "info": {
+    "_postman_id": "9cd31812-d985-4f6a-b0b4-fbfeee7eb647",
+    "name": "Quacktion API",
+    "description": "Quacktion .NET API. Set baseUrl (default http://localhost:5188), register/login, then use the saved accessToken for protected routes. The API requires MongoDB to finish startup initialization. See AUTH.md for authentication and device pairing details.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:5188" },
+    { "key": "email", "value": "developer@example.test" },
+    { "key": "password", "value": "replace-with-a-12-character-password" },
+    { "key": "newPassword", "value": "replace-with-another-12-character-password" },
+    { "key": "name", "value": "Developer" },
+    { "key": "deviceIdentifier", "value": "device-001" },
+    { "key": "deviceName", "value": "Test device" },
+    { "key": "sessionTitle", "value": "Test session" },
+    { "key": "accessToken", "value": "" },
+    { "key": "refreshToken", "value": "" },
+    { "key": "deviceId", "value": "" },
+    { "key": "sessionId", "value": "" },
+    { "key": "quacktionId", "value": "" },
+    { "key": "actionDigest", "value": "" },
+    { "key": "challengeId", "value": "" },
+    { "key": "challenge", "value": "" }
+  ],
+  "auth": {
+    "type": "bearer",
+    "bearer": [{ "key": "token", "value": "{{accessToken}}", "type": "string" }]
+  },
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        { "name": "Liveness", "request": { "auth": { "type": "noauth" }, "method": "GET", "url": "{{baseUrl}}/health/live" } },
+        { "name": "Readiness", "request": { "auth": { "type": "noauth" }, "method": "GET", "url": "{{baseUrl}}/health/ready" } }
+      ]
+    },
+    {
+      "name": "Accounts and authentication",
+      "item": [
+        {
+          "name": "Register account",
+          "request": { "auth": { "type": "noauth" }, "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"{{password}}\",\n  \"name\": \"{{name}}\"\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/api/accounts" }
+        },
+        {
+          "name": "Login",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["if (pm.response.code === 200) {", "  const body = pm.response.json();", "  if (body.accessToken) pm.collectionVariables.set('accessToken', body.accessToken);", "  if (body.refreshToken) pm.collectionVariables.set('refreshToken', body.refreshToken);", "}"] } }],
+          "request": { "auth": { "type": "noauth" }, "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"{{password}}\"\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/api/auth/login" }
+        },
+        {
+          "name": "Refresh tokens",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["if (pm.response.code === 200) {", "  const body = pm.response.json();", "  if (body.accessToken) pm.collectionVariables.set('accessToken', body.accessToken);", "  if (body.refreshToken) pm.collectionVariables.set('refreshToken', body.refreshToken);", "}"] } }],
+          "request": { "auth": { "type": "noauth" }, "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"refreshToken\": \"{{refreshToken}}\"\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/api/auth/refresh" }
+        },
+        { "name": "Logout", "request": { "auth": { "type": "noauth" }, "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"refreshToken\": \"{{refreshToken}}\"\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/api/auth/logout" }, "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["if (pm.response.code === 204) {", "  pm.collectionVariables.unset('accessToken');", "  pm.collectionVariables.unset('refreshToken');", "}"] } }] },
+        { "name": "Get my account", "request": { "method": "GET", "url": "{{baseUrl}}/api/accounts/me" } },
+        { "name": "Update my profile", "request": { "method": "PATCH", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{name}}\"\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/api/accounts/me" } },
+        { "name": "Change my password", "request": { "method": "PUT", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"currentPassword\": \"{{password}}\",\n  \"newPassword\": \"{{newPassword}}\"\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/api/accounts/me/password" } },
+        { "name": "Delete my account (deactivates account)", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/accounts/me" } }
+      ]
+    },
+    {
+      "name": "Devices",
+      "item": [
+        {
+          "name": "Create device",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["if (pm.response.code === 201) {", "  const body = pm.response.json();", "  if (body.device && body.device.id) pm.collectionVariables.set('deviceId', body.device.id);", "  if (body.pairing) {", "    pm.collectionVariables.set('challengeId', body.pairing.challengeId);", "    pm.collectionVariables.set('challenge', body.pairing.challenge);", "  }", "}"] } }],
+          "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"deviceIdentifier\": \"{{deviceIdentifier}}\",\n  \"name\": \"{{deviceName}}\",\n  \"firmwareVersion\": \"0.1.0\"\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/api/devices" }
+        },
+        { "name": "List devices", "request": { "method": "GET", "url": "{{baseUrl}}/api/devices?offset=0&limit=50" } },
+        { "name": "Get device", "request": { "method": "GET", "url": "{{baseUrl}}/api/devices/{{deviceId}}" } },
+        { "name": "Update device", "request": { "method": "PATCH", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{deviceName}}\",\n  \"firmwareVersion\": \"0.1.0\"\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/api/devices/{{deviceId}}" } },
+        { "name": "Get pairing challenge", "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["if (pm.response.code === 200) {", "  const body = pm.response.json();", "  if (body.challengeId) pm.collectionVariables.set('challengeId', body.challengeId);", "  if (body.challenge) pm.collectionVariables.set('challenge', body.challenge);", "}"] } }], "request": { "method": "POST", "url": "{{baseUrl}}/api/devices/{{deviceId}}/pairing-challenges" } },
+        { "name": "Pair device", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"challengeId\": \"{{challengeId}}\",\n  \"challenge\": \"{{challenge}}\"\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/api/devices/{{deviceId}}/pair" } },
+        { "name": "Get device status", "request": { "method": "GET", "url": "{{baseUrl}}/api/devices/{{deviceId}}/status" } },
+        { "name": "Unpair device", "request": { "method": "POST", "url": "{{baseUrl}}/api/devices/{{deviceId}}/unpair" } },
+        { "name": "Delete device", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/devices/{{deviceId}}" } }
+      ]
+    },
+    {
+      "name": "Sessions",
+      "item": [
+        {
+          "name": "Create session",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["if (pm.response.code === 201) {", "  const body = pm.response.json();", "  if (body.id) pm.collectionVariables.set('sessionId', body.id);", "}"] } }],
+          "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"title\": \"{{sessionTitle}}\",\n  \"deviceId\": null\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/api/sessions" }
+        },
+        { "name": "List sessions", "request": { "method": "GET", "url": "{{baseUrl}}/api/sessions?offset=0&limit=50" } },
+        { "name": "Get session", "request": { "method": "GET", "url": "{{baseUrl}}/api/sessions/{{sessionId}}" } },
+        { "name": "Update session", "request": { "method": "PATCH", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"title\": \"{{sessionTitle}}\"\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/api/sessions/{{sessionId}}" } },
+        { "name": "Start session", "request": { "method": "POST", "url": "{{baseUrl}}/api/sessions/{{sessionId}}/start" } },
+        { "name": "End session", "request": { "method": "POST", "url": "{{baseUrl}}/api/sessions/{{sessionId}}/end" } },
+        { "name": "Get transcript", "request": { "method": "GET", "url": "{{baseUrl}}/api/sessions/{{sessionId}}/transcript?offset=0&limit=50" } },
+        { "name": "List session Quacktions", "request": { "method": "GET", "url": "{{baseUrl}}/api/sessions/{{sessionId}}/quacktions?offset=0&limit=50" } },
+        {
+          "name": "Propose Quacktion",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["if (pm.response.code === 201) {", "  const body = pm.response.json();", "  if (body.id) pm.collectionVariables.set('quacktionId', body.id);", "  if (body.actionDigest) pm.collectionVariables.set('actionDigest', body.actionDigest);", "}"] } }],
+          "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"actionType\": \"internal.summary\",\n  \"parametersJson\": \"{}\"\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/api/sessions/{{sessionId}}/quacktions" }
+        },
+        { "name": "Delete session (only if never started)", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/sessions/{{sessionId}}" } }
+      ]
+    },
+    {
+      "name": "Quacktions",
+      "item": [
+        { "name": "List Quacktions", "request": { "method": "GET", "url": "{{baseUrl}}/api/quacktions?offset=0&limit=50" } },
+        { "name": "Get Quacktion", "request": { "method": "GET", "url": "{{baseUrl}}/api/quacktions/{{quacktionId}}" } },
+        { "name": "Approve Quacktion", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"actionDigest\": \"{{actionDigest}}\"\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/api/quacktions/{{quacktionId}}/approve" } },
+        { "name": "Reject Quacktion", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"actionDigest\": \"{{actionDigest}}\"\n}", "options": { "raw": { "language": "json" } } }, "url": "{{baseUrl}}/api/quacktions/{{quacktionId}}/reject" } },
+        { "name": "Cancel Quacktion", "request": { "method": "POST", "url": "{{baseUrl}}/api/quacktions/{{quacktionId}}/cancel" } },
+        { "name": "Retry Quacktion", "request": { "method": "POST", "url": "{{baseUrl}}/api/quacktions/{{quacktionId}}/retry" } }
+      ]
+    },
+    {
+      "name": "Agent catalog",
+      "item": [{ "name": "List configured agents", "request": { "method": "GET", "url": "{{baseUrl}}/api/agents" } }]
+    }
+  ]
+}
