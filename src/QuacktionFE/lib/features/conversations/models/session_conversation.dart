@@ -7,5 +7,14 @@ class SessionConversation extends Conversation {
     required super.updatedAt,
   });
   String status = 'Created';
-  bool get canEnd => status == 'Active';
+  bool get canEnd => status == 'Active' || status == 'Suspended';
+  bool get canResume =>
+      status == 'Active' || status == 'Suspended' || status == 'Completed';
+  bool get shouldPoll =>
+      status == 'Ready' ||
+      status == 'Starting' ||
+      status == 'Connecting' ||
+      status == 'Active' ||
+      status == 'Suspended' ||
+      status == 'Ending';
 }

@@ -114,12 +114,14 @@ class AuthController extends ChangeNotifier {
     String method,
     String path, {
     Map<String, dynamic>? body,
+    Uint8List? binaryBody,
     bool retryUnauthorized = true,
     Map<String, String>? headers,
   }) => api.authorized(
     method,
     path,
     body: body,
+    binaryBody: binaryBody,
     retryUnauthorized: retryUnauthorized,
     headers: headers,
   );

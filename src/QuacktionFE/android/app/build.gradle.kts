@@ -39,6 +39,7 @@ android {
 }
 
 dependencies {
+    implementation("androidx.browser:browser:1.8.0")
     // Espressif handles BLE provisioning transport and Security 2 (SRP6a/AES-GCM).
     implementation("com.github.espressif:esp-idf-provisioning-android:lib-2.4.4")
     implementation("org.greenrobot:eventbus:3.3.1")

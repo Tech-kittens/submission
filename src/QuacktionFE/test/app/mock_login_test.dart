@@ -1,27 +1,28 @@
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:quacktion_frontend/app/app.dart';
+import 'package:flutter/material.dart';
+import 'package:quacktion_frontend/core/storage/token_store.dart';
+import 'package:quacktion_frontend/features/auth/application/auth_controller.dart';
+import 'package:quacktion_frontend/features/auth/presentation/screens/auth_screen.dart';
 
 void main() {
-  testWidgets('any entered value continues into the demo app', (tester) async {
-    await tester.pumpWidget(const MainApp());
-    expect(find.text('Welcome'), findsOneWidget);
-
-    await tester.enterText(find.byType(TextField), 'not-an-email');
-    await tester.tap(find.text('Continue'));
+  testWidgets('the app opens on the real authentication screen', (
+    tester,
+  ) async {
+    final auth = AuthController(store: _MemoryTokenStore());
+    addTearDown(auth.dispose);
+    await tester.pumpWidget(MaterialApp(home: AuthScreen(auth: auth)));
     await tester.pumpAndSettle();
-
-    expect(find.text('Planning the weekend'), findsOneWidget);
-    expect(find.text('Welcome'), findsNothing);
-    await tester.tap(find.byTooltip('Conversation history'));
-    await tester.pumpAndSettle();
-    await tester.tap(
-      find.descendant(
-        of: find.byType(Drawer),
-        matching: find.text('Account settings'),
-      ),
-    );
-    await tester.pumpAndSettle();
-    expect(find.text('not-an-email'), findsNWidgets(2));
+    expect(find.text('Welcome back'), findsOneWidget);
+    expect(find.text('Sign in'), findsOneWidget);
+    expect(find.text('Create an account'), findsOneWidget);
   });
+}
+
+class _MemoryTokenStore implements TokenStore {
+  @override
+  Future<String?> read() async => null;
+  @override
+  Future<void> write(String value) async {}
+  @override
+  Future<void> clear() async {}
 }

@@ -1,9 +1,12 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 
+import 'package:quacktion_frontend/core/networking/api_exception.dart';
+import 'package:quacktion_frontend/features/devices/data/backend_device_linker.dart';
 import 'package:quacktion_frontend/features/devices/data/speaker_provisioning.dart';
+import 'package:quacktion_frontend/features/devices/data/saved_speaker_store.dart';
 
 enum PairingStage {
   idle,
@@ -19,10 +22,85 @@ enum PairingStage {
 class DeviceSetupController extends ChangeNotifier {
   DeviceSetupController(
     this.provisioning, {
+    this.speakerStore,
+    this.backendLinker,
+    this.onBackendLinked,
     this.pollInterval = const Duration(seconds: 1),
-  });
+  }) {
+    final Object transport = provisioning;
+    if (transport is DeviceConnectionEvents) {
+      _connectionEvents = transport.connectionEvents.listen((connected) {
+        if (_disposed || connected || !_linkConnected) return;
+        _linkConnected = false;
+        _statusPoll?.cancel();
+        selected = null;
+        stage = PairingStage.idle;
+        _emit();
+      }, onError: (_) {});
+    }
+    if (speakerStore != null) unawaited(_loadSavedSpeaker());
+  }
   final DeviceProvisioning provisioning;
+  final SavedSpeakerStore? speakerStore;
+  final BackendDeviceLinker? backendLinker;
+  final VoidCallback? onBackendLinked;
   final Duration pollInterval;
+  StreamSubscription<bool>? _connectionEvents;
+  Timer? _statusPoll;
+  bool get configurationBusy => busy;
+  bool get readyToComplete =>
+      approved && wifiState == 'connected' && backendState == 'online';
+
+  // Only poll an explicitly opened BLE connection; normal operation has no BLE.
+  void _startStatusPolling() {
+    _statusPoll?.cancel();
+    _statusPoll = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (_linkConnected && !busy && !_disposed) {
+        refreshStatus().catchError((_) {});
+      }
+    });
+  }
+
+  Future<void> configureSavedSpeaker() => reconnect();
+
+  Future<void> finishConfiguration() async {
+    if (configurationBusy || !_linkConnected || !readyToComplete) return;
+    busy = true;
+    error = null;
+    _emit();
+    try {
+      await _request('setup.complete');
+      await remove();
+    } catch (failure) {
+      error = _friendlyError(failure);
+    } finally {
+      busy = false;
+      _emit();
+    }
+  }
+
+  Future<void> cancelSetup() async {
+    if (busy || !_linkConnected || !approved) return;
+    busy = true;
+    error = null;
+    _emit();
+    try {
+      await _request('setup.cancel');
+      await remove();
+    } catch (failure) {
+      error = _friendlyError(failure);
+    } finally {
+      busy = false;
+      _emit();
+    }
+  }
+
+  Future<void> retryBackendLink() async {
+    if (busy || !approved || _linkingBackend) return;
+    error = null;
+    _backendLinkAttempted = false;
+    await _linkBackendDevice();
+  }
 
   PairingStage stage = PairingStage.idle;
   List<NearbySpeaker> nearby = const [];
@@ -30,15 +108,29 @@ class DeviceSetupController extends ChangeNotifier {
   NearbySpeaker? selected;
   String? deviceIdentifier;
   String? deviceName;
+  String firmwareVersion = '';
   String? wifiNetwork;
   String? wifiState;
   String? backendState;
+  SavedSpeaker? savedSpeaker;
   String? error;
   bool dppSupported = false;
   bool busy = false;
   bool _refreshingStatus = false;
   bool _disposed = false;
+  bool _linkConnected = false;
+  bool _linkingBackend = false;
+  bool _backendLinkAttempted = false;
   int _generation = 0;
+
+  Future<void> _loadSavedSpeaker() async {
+    try {
+      savedSpeaker = await speakerStore!.read();
+      _emit();
+    } catch (_) {
+      // Keep device setup available if secure storage is unavailable.
+    }
+  }
 
   bool get approved =>
       stage == PairingStage.paired ||
@@ -60,7 +152,7 @@ class DeviceSetupController extends ChangeNotifier {
       nearby = await provisioning.scan();
       if (_disposed || generation != _generation) return;
       stage = PairingStage.found;
-      if (nearby.isEmpty) error = 'No speaker found. Hold its setup button for 3 seconds and scan again.';
+      if (nearby.isEmpty) error = 'No speaker found. Hold K2 for 3 seconds and release to open setup, then scan again.';
     } catch (exception) {
       if (_disposed || generation != _generation) return;
       stage = PairingStage.idle;
@@ -72,6 +164,7 @@ class DeviceSetupController extends ChangeNotifier {
   Future<void> pair(NearbySpeaker speaker) async {
     if (busy) return;
     ++_generation;
+    _backendLinkAttempted = false;
     busy = true;
     selected = speaker;
     stage = PairingStage.connecting;
@@ -79,14 +172,28 @@ class DeviceSetupController extends ChangeNotifier {
     _emit();
     try {
       await provisioning.connect(speaker);
+      _linkConnected = true;
       final info = await _request('device.info');
       deviceIdentifier = info['deviceIdentifier']?.toString();
       deviceName = speaker.name;
+      firmwareVersion = info['firmwareVersion']?.toString() ?? '';
+      final identifier = deviceIdentifier;
+      if (identifier != null && identifier.isNotEmpty && speakerStore != null) {
+        final sameSpeaker = savedSpeaker?.identifier == identifier;
+        savedSpeaker = SavedSpeaker(
+          identifier: identifier,
+          name: speaker.name,
+          backendDeviceId: sameSpeaker ? savedSpeaker?.backendDeviceId : null,
+          firmwareVersion: firmwareVersion,
+        );
+        await speakerStore!.write(savedSpeaker!);
+      }
       dppSupported =
           await provisioning.isDppSupported() &&
           (info['capabilities'] is Map &&
               (info['capabilities'] as Map)['dpp'] == true);
       await refreshStatus(force: true);
+      _startStatusPolling();
     } catch (exception) {
       error = _friendlyError(exception);
       if (exception is PlatformException) {
@@ -117,18 +224,71 @@ class DeviceSetupController extends ChangeNotifier {
     }
   }
 
+  Future<void> reconnect({bool quiet = false}) async {
+    final remembered = savedSpeaker;
+    if (busy || remembered == null) return;
+    busy = true;
+    _backendLinkAttempted = false;
+    stage = PairingStage.scanning;
+    error = null;
+    _emit();
+    try {
+      nearby = await provisioning.scan();
+      for (final speaker in nearby) {
+        try {
+          await provisioning.connect(speaker);
+          _linkConnected = true;
+          final info = await _request('device.info');
+          if (info['deviceIdentifier'] != remembered.identifier) {
+            await provisioning.disconnect();
+            _linkConnected = false;
+            continue;
+          }
+          selected = speaker;
+          deviceIdentifier = remembered.identifier;
+          deviceName = remembered.name;
+          firmwareVersion =
+              info['firmwareVersion']?.toString() ?? remembered.firmwareVersion;
+          dppSupported =
+              await provisioning.isDppSupported() &&
+              (info['capabilities'] is Map &&
+                  (info['capabilities'] as Map)['dpp'] == true);
+          await refreshStatus(force: true);
+          _startStatusPolling();
+          return;
+        } catch (_) {
+          await provisioning.disconnect();
+          _linkConnected = false;
+        }
+      }
+      stage = PairingStage.idle;
+      if (!quiet) {
+        error = 'Speaker setup Bluetooth is off or out of range. Hold K2 for 3 seconds and release, then try again.';
+      }
+    } catch (exception) {
+      stage = PairingStage.idle;
+      if (!quiet) error = _friendlyError(exception);
+    } finally {
+      busy = false;
+      _emit();
+    }
+  }
+
   Future<void> refreshStatus({bool force = false}) async {
     if (_refreshingStatus || (busy && !force)) return;
     _refreshingStatus = true;
     try {
       final status = await _request('setup.status');
+      _linkConnected = true;
       wifiState = status['wifiState']?.toString();
       backendState = status['backendState']?.toString();
       wifiNetwork = status['ssid']?.toString();
       if (status['approval'] == 'approved') {
+        _linkConnected = true;
         stage = wifiState == 'connected'
             ? PairingStage.wifiConfigured
             : PairingStage.paired;
+        await _linkBackendDevice();
       } else {
         stage = PairingStage.awaitingApproval;
       }
@@ -136,10 +296,57 @@ class DeviceSetupController extends ChangeNotifier {
     } catch (exception) {
       if (exception is PlatformException) {
         _resetAfterLinkLoss(exception);
+      } else {
+        error = _friendlyError(exception);
+        _emit();
       }
       rethrow;
     } finally {
       _refreshingStatus = false;
+    }
+  }
+
+  Future<void> _linkBackendDevice() async {
+    final linker = backendLinker;
+    final identifier = deviceIdentifier;
+    final saved = savedSpeaker;
+    if (linker == null ||
+        identifier == null ||
+        identifier.isEmpty ||
+        saved == null ||
+        _linkingBackend ||
+        _backendLinkAttempted) {
+      return;
+    }
+    _backendLinkAttempted = true;
+    _linkingBackend = true;
+    try {
+      final link = await linker.link(
+        identifier: identifier,
+        name: deviceName ?? saved.name,
+        firmwareVersion: firmwareVersion,
+        speakerBackendState: backendState ?? 'unlinked',
+      );
+      if (link.credential != null) {
+        await _request('backend.configure', {
+          'deviceId': link.deviceId,
+          'credential': link.credential!,
+        });
+      }
+      savedSpeaker = SavedSpeaker(
+        identifier: saved.identifier,
+        name: deviceName ?? saved.name,
+        backendDeviceId: link.deviceId,
+        firmwareVersion: firmwareVersion,
+      );
+      await speakerStore?.write(savedSpeaker!);
+      onBackendLinked?.call();
+    } catch (exception) {
+      error =
+          'Speaker connected, but account linking failed: ${_friendlyError(exception)}';
+    } finally {
+      _linkingBackend = false;
+      _emit();
     }
   }
 
@@ -276,6 +483,25 @@ class DeviceSetupController extends ChangeNotifier {
     }
   }
 
+  Future<void> forgetWifi() async {
+    if (!approved || busy || wifiState != 'connected') return;
+    busy = true;
+    error = null;
+    _emit();
+    try {
+      await _request('wifi.forget');
+      wifiState = 'unconfigured';
+      wifiNetwork = null;
+      stage = PairingStage.paired;
+    } catch (exception) {
+      error = _friendlyError(exception);
+      if (exception is PlatformException) _resetAfterLinkLoss(exception);
+    } finally {
+      busy = false;
+      _emit();
+    }
+  }
+
   Future<void> _waitForWifi({
     Duration timeout = const Duration(seconds: 45),
   }) async {
@@ -301,14 +527,10 @@ class DeviceSetupController extends ChangeNotifier {
   }
 
   Future<void> remove() async {
-    try {
-      if (paired) {
-        await _request('setup.cancel');
-      }
-    } catch (_) {
-      // The link may already have dropped; always release the local BLE connection.
-    }
+    // Keep the remembered identity and the speaker's saved configuration.
     await provisioning.disconnect();
+    _linkConnected = false;
+    _statusPoll?.cancel();
     ++_generation;
     stage = PairingStage.idle;
     nearby = const [];
@@ -316,6 +538,7 @@ class DeviceSetupController extends ChangeNotifier {
     selected = null;
     deviceIdentifier = null;
     deviceName = null;
+    firmwareVersion = '';
     wifiNetwork = null;
     wifiState = null;
     backendState = null;
@@ -323,11 +546,26 @@ class DeviceSetupController extends ChangeNotifier {
     _emit();
   }
 
+  Future<bool> forgetSavedSpeaker() async {
+    if (busy || savedSpeaker == null) return false;
+    try {
+      await speakerStore?.delete();
+      savedSpeaker = null;
+      await remove();
+      return true;
+    } catch (exception) {
+      error = _friendlyError(exception);
+      _emit();
+      return false;
+    }
+  }
+
   void cancelScan() => ++_generation;
 
   Future<void> cancelConnection() async {
     ++_generation;
     await provisioning.disconnect();
+    _linkConnected = false;
     if (_disposed) return;
     selected = null;
     stage = PairingStage.idle;
@@ -344,6 +582,7 @@ class DeviceSetupController extends ChangeNotifier {
       'id': id,
       ...fields,
     });
+    _linkConnected = true;
     if (response['ok'] != true) {
       throw FirmwareProvisioningException(
         response['error']?.toString() ?? 'internal_error',
@@ -354,6 +593,8 @@ class DeviceSetupController extends ChangeNotifier {
   }
 
   void _resetAfterLinkLoss(PlatformException exception) {
+    _linkConnected = false;
+    _statusPoll?.cancel();
     selected = null;
     deviceIdentifier = null;
     deviceName = null;
@@ -367,6 +608,7 @@ class DeviceSetupController extends ChangeNotifier {
   }
 
   String _friendlyError(Object exception) {
+    if (exception is ApiException) return exception.message;
     if (exception is PlatformException) {
       return exception.message ?? exception.code;
     }
@@ -382,7 +624,7 @@ class DeviceSetupController extends ChangeNotifier {
   String _firmwareError(String code) => switch (code) {
     'busy' => 'The speaker is already scanning or connecting. Wait a moment, then rescan.',
     'approval_required' =>
-      'Press the setup button on the speaker to approve this phone.',
+      'Briefly press K2 on the speaker to approve this setup connection.',
     'setup_expired' => 'Speaker setup mode expired. Hold its setup button for 3 seconds and try again.',
     'invalid_password' => 'That Wi-Fi password is not valid for this network.',
     'unsupported_auth' =>
@@ -406,7 +648,9 @@ class DeviceSetupController extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    _connectionEvents?.cancel();
     ++_generation;
+    _statusPoll?.cancel();
     unawaited(provisioning.disconnect());
     super.dispose();
   }

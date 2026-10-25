@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'package:quacktion_frontend/core/networking/api_exception.dart';
 import 'package:quacktion_frontend/features/auth/application/auth_controller.dart';
+import 'package:quacktion_frontend/shared/widgets/app_toast.dart';
 
 class AuthScreen extends StatefulWidget {
   const AuthScreen({
@@ -31,13 +32,15 @@ class _AuthScreenState extends State<AuthScreen> {
   bool _register = false;
   bool _busy = false;
   bool _showPassword = false;
-  String? _error;
-  String? _notice;
 
   @override
   void initState() {
     super.initState();
-    _notice = widget.initialMessage;
+    if (widget.initialMessage case final message?) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) AppToast.show(context, message, isError: true);
+      });
+    }
   }
 
   @override
@@ -51,14 +54,13 @@ class _AuthScreenState extends State<AuthScreen> {
   Future<void> _submit() async {
     if (_busy || !_form.currentState!.validate()) return;
     FocusScope.of(context).unfocus();
-    setState(() {
-      _busy = true;
-      _error = null;
-      _notice = null;
-    });
+    AppToast.dismiss();
+    setState(() => _busy = true);
     try {
       if (widget.changePassword) {
         await widget.auth.changePassword(_current.text, _password.text);
+        if (!mounted) return;
+        AppToast.show(context, 'Password updated.');
         widget.onPasswordChanged?.call();
       } else if (_register) {
         final email = _email.text;
@@ -69,18 +71,20 @@ class _AuthScreenState extends State<AuthScreen> {
           _register = false;
           _password.clear();
           _confirm.clear();
-          _notice = 'Account created. Sign in to get started.';
         });
+        AppToast.show(context, 'Account created. Signing you in…');
         await widget.auth.login(email, password);
       } else {
         await widget.auth.login(_email.text, _password.text);
       }
     } on ApiException catch (error) {
-      if (mounted) setState(() => _error = error.message);
+      if (mounted) AppToast.show(context, error.message, isError: true);
     } catch (_) {
       if (mounted) {
-        setState(
-          () => _error = 'Could not complete the request. Please try again.',
+        AppToast.show(
+          context,
+          'Could not complete the request. Please try again.',
+          isError: true,
         );
       }
     } finally {
@@ -146,8 +150,6 @@ class _AuthScreenState extends State<AuthScreen> {
   void _toggleMode() {
     setState(() {
       _register = !_register;
-      _error = null;
-      _notice = null;
       _password.clear();
       _confirm.clear();
       _showPassword = false;
@@ -206,14 +208,6 @@ class _AuthScreenState extends State<AuthScreen> {
                         style: Theme.of(context).textTheme.titleLarge,
                       ),
                       const SizedBox(height: 24),
-                      if (_notice != null)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 16),
-                          child: Semantics(
-                            liveRegion: true,
-                            child: Text(_notice!),
-                          ),
-                        ),
                       if (changing)
                         _field(
                           'Current password',
@@ -274,19 +268,6 @@ class _AuthScreenState extends State<AuthScreen> {
                               : null,
                         ),
                       ],
-                      if (_error != null)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 16),
-                          child: Semantics(
-                            liveRegion: true,
-                            child: Text(
-                              _error!,
-                              style: TextStyle(
-                                color: Theme.of(context).colorScheme.error,
-                              ),
-                            ),
-                          ),
-                        ),
                       FilledButton(
                         onPressed: _busy ? null : _submit,
                         child: _busy

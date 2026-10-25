@@ -35,8 +35,12 @@ class _DeviceSetupScreenState extends State<DeviceSetupScreen> {
     }
   }
 
-  Future<void> _pair() async {
-    unawaited(widget.controller.scan());
+  Future<void> _pair({bool saved = false}) async {
+    unawaited(
+      saved
+          ? widget.controller.configureSavedSpeaker()
+          : widget.controller.scan(),
+    );
     final configure = await Navigator.of(context).push<bool>(
       MaterialPageRoute(
         builder: (context) => PairDeviceScreen(
@@ -54,18 +58,82 @@ class _DeviceSetupScreenState extends State<DeviceSetupScreen> {
     if (mounted && configure == true) await _configureWifi();
   }
 
+  Future<void> _forgetWifi() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Disconnect Wi-Fi?'),
+        content: const Text(
+          'This disconnects the speaker and removes its saved Wi-Fi name and password.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Disconnect'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || confirm != true) return;
+    await widget.controller.forgetWifi();
+    if (!mounted) return;
+    if (widget.controller.error == null) {
+      widget.onMessage('Wi-Fi disconnected. Saved network removed.');
+    }
+  }
+
+  Future<void> _unpair() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Forget saved speaker?'),
+        content: const Text(
+          'This removes the saved speaker from this phone. Its Wi-Fi settings and backend account registration remain unchanged.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Forget'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || confirmed != true) return;
+    final unpaired = await widget.controller.forgetSavedSpeaker();
+    if (!mounted) return;
+    if (unpaired) widget.onMessage('Speaker removed from this phone.');
+  }
+
   @override
   Widget build(BuildContext context) => ListenableBuilder(
     listenable: widget.controller,
     builder: (context, _) => DevicesPage(
       devicePaired: widget.controller.paired,
-      deviceName: widget.controller.deviceName,
+      deviceName:
+          widget.controller.deviceName ?? widget.controller.savedSpeaker?.name,
       wifiNetwork: widget.controller.wifiNetwork,
       wifiState: widget.controller.wifiState,
       backendState: widget.controller.backendState,
-      onPair: _pair,
+      onPair: () => _pair(),
+      onReconnect: () => unawaited(_pair(saved: true)),
+      hasSavedSpeaker: widget.controller.savedSpeaker != null,
+      busy: widget.controller.configurationBusy,
+      onFinishConfiguration: widget.controller.readyToComplete
+          ? () => unawaited(widget.controller.finishConfiguration())
+          : null,
+      onCancelSetup: () => unawaited(widget.controller.cancelSetup()),
+      onRetryBackend: () => unawaited(widget.controller.retryBackendLink()),
       onConfigureWifi: _configureWifi,
-      onRemove: widget.controller.remove,
+      onForgetWifi: () => unawaited(_forgetWifi()),
+      onUnpair: () => unawaited(_unpair()),
     ),
   );
 }

@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:quacktion_frontend/core/networking/api_exception.dart';
 import 'package:quacktion_frontend/core/networking/http_transport.dart';
 
@@ -9,6 +11,7 @@ abstract interface class ApiClient {
     String method,
     String path, {
     Map<String, dynamic>? body,
+    Uint8List? binaryBody,
     bool retryUnauthorized = true,
     Map<String, String>? headers,
   });
@@ -35,6 +38,7 @@ class AuthenticatedApiClient implements ApiClient {
     String method,
     String path, {
     Map<String, dynamic>? body,
+    Uint8List? binaryBody,
     bool retryUnauthorized = true,
     Map<String, String>? headers,
   }) async {
@@ -44,6 +48,7 @@ class AuthenticatedApiClient implements ApiClient {
         method,
         path,
         body: body,
+        binaryBody: binaryBody,
         accessToken: usedToken,
         headers: headers,
       );
@@ -60,6 +65,7 @@ class AuthenticatedApiClient implements ApiClient {
           method,
           path,
           body: body,
+          binaryBody: binaryBody,
           accessToken: replacement,
           headers: headers,
         );

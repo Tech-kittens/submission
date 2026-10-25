@@ -9,7 +9,7 @@ class MessageBubble extends StatelessWidget {
   Widget build(BuildContext context) {
     final assistant = message.source == MessageSource.assistant;
     final label = switch (message.source) {
-      MessageSource.app => 'You · App',
+      MessageSource.app => 'You',
       MessageSource.speaker => 'You · Speaker',
       MessageSource.assistant => 'Quacktion',
     };
@@ -52,11 +52,6 @@ class MessageBubble extends StatelessWidget {
                 ],
               ),
               const SizedBox(height: 6),
-              const Text(
-                'Demo transcript',
-                style: TextStyle(fontSize: 12, color: Colors.black54),
-              ),
-              const SizedBox(height: 8),
             ],
             SelectableText(
               message.text,

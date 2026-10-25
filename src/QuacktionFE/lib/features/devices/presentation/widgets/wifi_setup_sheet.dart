@@ -48,15 +48,6 @@ class _WifiSetupSheetState extends State<WifiSetupSheet> {
         (!_showHidden && _selected?.supported != true)) {
       return;
     }
-    debugPrint(
-      {
-        'ssid': ssid,
-        'password': _selected?.auth == 'open' && !_showHidden
-            ? ''
-            : _password.text,
-        'hidden': _showHidden,
-      }.toString(),
-    );
     await widget.controller.configureWifi(
       ssid,
       _selected?.auth == 'open' && !_showHidden ? '' : _password.text,
@@ -108,8 +99,8 @@ class _WifiSetupSheetState extends State<WifiSetupSheet> {
             const SizedBox(height: 8),
             Text(
               controller.dppSupported
-                  ? 'Let Android share your current Wi-Fi network with the speaker securely. No QR code or password entry is needed.'
-                  : 'The speaker connects directly to a 2.4 GHz network. Its Wi-Fi password is sent over the encrypted Bluetooth setup link.',
+                  ? 'Share your current Wi-Fi network, or choose a network below.'
+                  : 'Choose a 2.4 GHz network for your speaker.',
               textAlign: TextAlign.center,
               style: TextStyle(color: Color(0xFF69685F), height: 1.45),
             ),
@@ -126,16 +117,6 @@ class _WifiSetupSheetState extends State<WifiSetupSheet> {
                 label: const Text('Set up Wi-Fi manually'),
               ),
               if (!_showManualSetup) ...[
-                if (controller.error != null) ...[
-                  const SizedBox(height: 8),
-                  Text(
-                    controller.error!,
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.error,
-                    ),
-                  ),
-                ],
                 if (busy) ...[
                   const SizedBox(height: 12),
                   const Center(child: CircularProgressIndicator()),
@@ -227,7 +208,7 @@ class _WifiSetupSheetState extends State<WifiSetupSheet> {
                   controller: _hiddenSsid,
                   enabled: !busy,
                   decoration: const InputDecoration(
-                    labelText: 'Wi-Fi name (SSID)',
+                    labelText: 'Wi-Fi name',
                     border: OutlineInputBorder(),
                   ),
                   onChanged: (_) => setState(() {}),
@@ -250,13 +231,6 @@ class _WifiSetupSheetState extends State<WifiSetupSheet> {
                       ),
                     ),
                   ),
-                ),
-              ],
-              if (controller.error != null) ...[
-                const SizedBox(height: 12),
-                Text(
-                  controller.error!,
-                  style: TextStyle(color: Theme.of(context).colorScheme.error),
                 ),
               ],
               if (busy) ...[

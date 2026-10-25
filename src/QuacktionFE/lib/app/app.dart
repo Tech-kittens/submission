@@ -4,6 +4,8 @@ import 'package:quacktion_frontend/app/app_shell.dart';
 import 'package:quacktion_frontend/app/dependencies.dart';
 import 'package:quacktion_frontend/app/theme/app_theme.dart';
 import 'package:quacktion_frontend/features/auth/presentation/screens/auth_screen.dart';
+import 'package:quacktion_frontend/features/integrations/data/mcp_auth_links.dart';
+import 'package:quacktion_frontend/shared/widgets/app_toast.dart';
 
 class MainApp extends StatefulWidget {
   const MainApp({super.key});
@@ -13,13 +15,14 @@ class MainApp extends StatefulWidget {
 
 class _MainAppState extends State<MainApp> {
   final _auth = AppDependencies.createAuth();
-  final _messenger = GlobalKey<ScaffoldMessengerState>();
+  final _authLinks = McpAuthLinks();
   bool _loading = true;
   String? _startupError;
 
   @override
   void initState() {
     super.initState();
+    _authLinks.initialize();
     _restore();
   }
 
@@ -35,18 +38,15 @@ class _MainAppState extends State<MainApp> {
 
   @override
   void dispose() {
+    _authLinks.dispose();
     _auth.dispose();
     super.dispose();
   }
-
-  void _message(String message) =>
-      _messenger.currentState?.showSnackBar(SnackBar(content: Text(message)));
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Quacktion',
-      scaffoldMessengerKey: _messenger,
       debugShowCheckedModeBanner: false,
       theme: AppTheme.light,
       home: _loading
@@ -56,7 +56,11 @@ class _MainAppState extends State<MainApp> {
               builder: (context, _) {
                 return _auth.profile == null
                     ? AuthScreen(auth: _auth, initialMessage: _startupError)
-                    : AppShell(auth: _auth, onMessage: _message);
+                    : AppShell(
+                        auth: _auth,
+                        authLinks: _authLinks,
+                        onMessage: (message) => AppToast.show(context, message),
+                      );
               },
             ),
     );

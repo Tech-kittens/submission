@@ -24,14 +24,23 @@ class ConversationVoiceControls extends StatefulWidget {
 
 class _ConversationVoiceControlsState extends State<ConversationVoiceControls>
     with WidgetsBindingObserver {
-  late final VoiceController voice =
-      widget.voice ?? widget.createVoice?.call() ?? VoiceController();
+  late final VoiceController voice = widget.voice ?? widget.createVoice!.call();
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    voice.onDemoStart = widget.store.beginMockVoiceConversation;
-    voice.onDemoReply = widget.store.addMockReply;
+    voice.conversationToResume = () {
+      final chat = widget.store.active;
+      return chat?.canResume == true ? chat : null;
+    };
+    voice.conversationName = () {
+      final chat = widget.store.active;
+      return chat != null && chat.status == 'Created'
+          ? chat.title
+          : 'Voice conversation';
+    };
+    voice.onSessionCreated = widget.store.addVoiceSession;
+    voice.onSessionUpdated = widget.store.updateVoiceSession;
   }
 
   @override
@@ -46,14 +55,13 @@ class _ConversationVoiceControlsState extends State<ConversationVoiceControls>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    voice.dispose();
+    if (widget.voice == null) voice.dispose();
     super.dispose();
   }
 
   Future<void> _end() async {
     debugPrint('Voice stopped: end button');
     await voice.stop();
-    await widget.store.end();
   }
 
   @override

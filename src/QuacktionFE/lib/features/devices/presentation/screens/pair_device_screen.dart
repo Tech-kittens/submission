@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 
 import 'package:quacktion_frontend/features/devices/application/device_setup_controller.dart';
@@ -21,35 +19,18 @@ class PairDeviceScreen extends StatefulWidget {
 }
 
 class _PairDeviceScreenState extends State<PairDeviceScreen> {
-  Timer? _approvalPoll;
-
   @override
   void initState() {
     super.initState();
     widget.controller.addListener(_changed);
-    _startApprovalPolling();
   }
 
   void _changed() {
     if (mounted) setState(() {});
-    _startApprovalPolling();
-  }
-
-  void _startApprovalPolling() {
-    if (widget.controller.stage == PairingStage.awaitingApproval &&
-        _approvalPoll == null) {
-      _approvalPoll = Timer.periodic(const Duration(seconds: 1), (_) {
-        widget.controller.refreshStatus().catchError((_) {});
-      });
-    } else if (widget.controller.stage != PairingStage.awaitingApproval) {
-      _approvalPoll?.cancel();
-      _approvalPoll = null;
-    }
   }
 
   @override
   void dispose() {
-    _approvalPoll?.cancel();
     widget.controller.removeListener(_changed);
     widget.controller.cancelScan();
     super.dispose();
@@ -111,14 +92,14 @@ class _PairDeviceScreenState extends State<PairDeviceScreen> {
                     const SizedBox(height: 10),
                     Text(
                       scanning
-                          ? 'Put your speaker in setup mode by holding its setup button for 3 seconds.'
+                          ? 'Hold K2 for 3 seconds and release to open setup. Keep the speaker nearby.'
                           : connecting
-                          ? 'Keep the speaker nearby while the encrypted setup link is created.'
+                          ? 'Connecting to your speaker…'
                           : pendingApproval
-                          ? 'Briefly press the setup button on ${controller.selected?.name ?? 'your speaker'} to approve this connection.'
+                          ? 'Briefly press K2 on ${controller.selected?.name ?? 'your speaker'} to approve this connection.'
                           : paired
                           ? 'Your speaker is connected over Bluetooth and ready for Wi-Fi setup.'
-                          : 'Scan for a Quacktion speaker in setup mode.',
+                          : 'Hold K2 for 3 seconds and release, then scan for your speaker.',
                       textAlign: TextAlign.center,
                       style: const TextStyle(
                         color: Color(0xFF69685F),
@@ -130,14 +111,6 @@ class _PairDeviceScreenState extends State<PairDeviceScreen> {
                       const Center(child: CircularProgressIndicator()),
                       const SizedBox(height: 20),
                     ],
-                    if (controller.error != null)
-                      Card(
-                        color: Theme.of(context).colorScheme.errorContainer,
-                        child: Padding(
-                          padding: const EdgeInsets.all(14),
-                          child: Text(controller.error!),
-                        ),
-                      ),
                     if (controller.nearby.isNotEmpty &&
                         !paired &&
                         !pendingApproval &&

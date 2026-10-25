@@ -1,7 +1,9 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 
 class NearbySpeaker {
   const NearbySpeaker({
@@ -38,7 +40,7 @@ class WifiNetwork {
 
 /// Encrypted BLE provisioning against the Quacktion firmware's custom endpoints.
 abstract interface class DeviceProvisioning {
-  Future<List<NearbySpeaker>> scan();
+  Future<List<NearbySpeaker>> scan({bool autoReconnect = false});
   Future<Map<String, dynamic>> connect(NearbySpeaker speaker);
   Future<Map<String, dynamic>> exchange(
     String endpoint,
@@ -49,16 +51,31 @@ abstract interface class DeviceProvisioning {
   Future<void> openDpp(String uri);
 }
 
-class FirmwareDeviceProvisioning implements DeviceProvisioning {
+abstract interface class DeviceConnectionEvents {
+  Stream<bool> get connectionEvents;
+}
+
+class FirmwareDeviceProvisioning
+    implements DeviceProvisioning, DeviceConnectionEvents {
   FirmwareDeviceProvisioning({MethodChannel? channel})
     : _channel =
           channel ?? const MethodChannel('quacktion/speaker_provisioning');
 
   final MethodChannel _channel;
+  @override
+  Stream<bool> get connectionEvents {
+    if (kIsWeb || !Platform.isAndroid) return const Stream<bool>.empty();
+    return const EventChannel('quacktion/speaker_connection')
+        .receiveBroadcastStream()
+        .where((event) => event is bool)
+        .cast<bool>();
+  }
 
   @override
-  Future<List<NearbySpeaker>> scan() async {
-    final rows = await _channel.invokeListMethod<Object?>('scan');
+  Future<List<NearbySpeaker>> scan({bool autoReconnect = false}) async {
+    final rows = await _channel.invokeListMethod<Object?>('scan', {
+      'autoReconnect': autoReconnect,
+    });
     return (rows ?? const [])
         .whereType<Map<Object?, Object?>>()
         .map(NearbySpeaker.fromMap)

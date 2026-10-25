@@ -4,8 +4,38 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:quacktion_frontend/features/auth/presentation/screens/auth_screen.dart';
 import 'package:quacktion_frontend/features/auth/application/auth_controller.dart';
+import 'package:quacktion_frontend/shared/widgets/app_toast.dart';
 
 void main() {
+  testWidgets('sign-in failures use a dismissible toast instead of form text', (
+    tester,
+  ) async {
+    final auth = AuthController(
+      client: MockClient((_) async => http.Response('{}', 401)),
+    );
+    addTearDown(auth.dispose);
+    addTearDown(AppToast.dismiss);
+    await tester.pumpWidget(MaterialApp(home: AuthScreen(auth: auth)));
+    await tester.enterText(
+      find.byType(TextFormField).at(0),
+      'test@example.com',
+    );
+    await tester.enterText(find.byType(TextFormField).at(1), 'test-password');
+    await tester.ensureVisible(find.text('Sign in'));
+    await tester.tap(find.text('Sign in'));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.textContaining('Your credentials are incorrect'),
+      findsOneWidget,
+    );
+    expect(find.byTooltip('Dismiss notification'), findsOneWidget);
+    await tester.tap(find.byTooltip('Dismiss notification'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Your credentials are incorrect'), findsNothing);
+    expect(find.text('Sign in'), findsOneWidget);
+  });
+
   testWidgets(
     'login validates input, exposes registration and explains recovery',
     (tester) async {

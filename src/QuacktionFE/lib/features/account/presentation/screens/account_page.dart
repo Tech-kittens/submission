@@ -26,7 +26,7 @@ class AccountPage extends StatelessWidget {
       children: [
         PageHeading(
           title: 'Your account',
-          subtitle: 'The personal side of Quacktion.',
+          subtitle: 'Manage your profile and security.',
         ),
         ContentPanel(
           child: Column(
