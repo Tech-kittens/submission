@@ -9,7 +9,7 @@ public sealed class MeetingToolService(IMeetingToolCallRepo calls, IQuacktionSer
     ISessionRepo sessions, IAccountRepo accounts, MeetingService? meetingLifecycle = null,
     IDeviceRepo? devices = null, IMeetingRepo? meetings = null,
     IMcpConnectionService? mcpConnections = null, IBriefingConversation? briefings = null,
-    IQuacktionRepo? taskRepo = null, IApprovalService? approvals = null)
+    IApprovalService? approvals = null)
 {
 public static readonly string[] Capabilities = ["internal.preparation", "internal.summary", "internal.analysis", "internal.research", "internal.suggestions", "internal.mcp_read", "mcp.request"];
 
@@ -99,28 +99,8 @@ public static readonly string[] Capabilities = ["internal.preparation", "interna
                 var meeting = Guard.Found(await meetings!.GetAsync(device.MeetingId!, ct));
                 Guard.State(meeting.OwnerAccountId == call.OwnerAccountId, "meeting_owner_mismatch");
                 meeting = await meetingLifecycle!.EndAsync(call.OwnerAccountId, meeting.Id, ct);
-                var sessionTasks = taskRepo is null ? Array.Empty<Quacktion.App.Models.Quacktion>() : (await taskRepo.ListAsync(
-                    x => x.OwnerAccountId == call.OwnerAccountId && x.SessionId == call.SessionId && x.CreatedAt >= meeting.CreatedAt,
-                    0, 100, ct)).ToArray();
-                var taskSummary = sessionTasks.Select(x => new
-                {
-                    taskId = x.Id,
-                    x.ActionType,
-                    request = TaskRequest(x.ActionType, x.ParametersJson),
-                    status = x.Status.ToString(),
-                    approvalNeeded = x.Status == QuacktionStatus.PendingApproval,
-                    approvalStatus = x.Approval?.Status.ToString()
-                }).ToArray();
-                call.ResultJson = JsonSerializer.Serialize(new
-                {
-                    meetingId = meeting.Id,
-                    status = meeting.Status.ToString(),
-                    postMeetingSummary = new
-                    {
-                        instruction = "First ask the user whether they want to hear a summary of background work, then wait for their answer. If they say yes, summarize the listed tasks and identify each item that still needs their approval. A request to hear the summary is not approval to perform a protected action or disclose a protected task result.",
-                        tasks = taskSummary
-                    }
-                });
+                call.ResponseScheduling = "SILENT";
+                call.ResultJson = JsonSerializer.Serialize(new { meetingId = meeting.Id, status = meeting.Status.ToString() });
             }
             else
             {
@@ -245,33 +225,6 @@ public static readonly string[] Capabilities = ["internal.preparation", "interna
         var text = value.GetString();
         Guard.Input(!string.IsNullOrWhiteSpace(text) && text.Length <= max, "invalid_tool_arguments");
         return text!;
-    }
-    private static string TaskRequest(string actionType, string json)
-    {
-        try
-        {
-            using var parsed = JsonDocument.Parse(json);
-            var root = parsed.RootElement;
-            if (root.TryGetProperty("query", out var query) && query.ValueKind == JsonValueKind.String)
-                return Bound(query.GetString() ?? actionType);
-            if (actionType == "mcp.invoke")
-            {
-                var tool = Property(root, "ToolName")?.ToString();
-                var server = Property(root, "ServerId")?.ToString();
-                var arguments = Property(root, "Arguments");
-                return Bound(string.Join(" ", new[] { server, tool }.Where(x => !string.IsNullOrWhiteSpace(x)))
-                    + (arguments is { } args ? " with arguments " + args.GetRawText() : ""));
-            }
-            return actionType;
-        }
-        catch (JsonException) { return actionType; }
-    }
-    private static string Bound(string value) => value.Length <= 2000 ? value : value[..2000];
-    private static JsonElement? Property(JsonElement root, string name)
-    {
-        foreach (var property in root.EnumerateObject())
-            if (string.Equals(property.Name, name, StringComparison.OrdinalIgnoreCase)) return property.Value;
-        return null;
     }
     private static void Fields(JsonElement args, params string[] allowed) =>
         Guard.Input(args.EnumerateObject().All(x => allowed.Contains(x.Name)), "invalid_tool_arguments");

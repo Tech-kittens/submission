@@ -24,6 +24,8 @@ public sealed class DeviceMeetingStream(IDeviceRepo devices, IMeetingRepo meetin
     private MeetingSegment? segment;
     private MemoryStream? pcm;
     public bool UsesMeetingAudio => negotiated || device.Mode == "meeting";
+    public bool IsMeetingMode => device.Mode == "meeting";
+    public string CurrentMode => device.Mode;
     public bool MutedByUser => device.MutedByUser;
     public void Initialize(Device current) => device = current;
     public static bool Handles(string? type) => type is "wake" or "backlog.dropped" or "error" or "device.status"

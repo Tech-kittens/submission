@@ -48,7 +48,8 @@ public sealed class DeviceNotificationService(IMongoDbContext db, DeviceConnecti
         foreach (var id in connections.ConnectedDeviceIds)
         {
             var connection = connections.Get(id);
-            if (connection is null || connection.Lifetime.IsCancellationRequested || connection.LastAssistantAudioAt > now.AddSeconds(-2)) continue;
+            if (connection is null || connection.Lifetime.IsCancellationRequested || connection.MeetingModeActive
+                || connection.LastAssistantAudioAt > now.AddSeconds(-2)) continue;
             // One in-flight notification per authenticated connection leaves headroom in the firmware's four-item queue.
             if (await Notifications.Find(x => x.DeviceId == id && x.Status == "Sent" && x.ConnectionId == connection.Id && x.NextAttemptAt > now).AnyAsync(ct)) continue;
             var lease = Guid.NewGuid().ToString("N");
@@ -78,7 +79,8 @@ public sealed class DeviceNotificationService(IMongoDbContext db, DeviceConnecti
                 }
                 // Calendar/preferences can change while TTS is running. Recheck immediately before enqueueing.
                 if (!await RelevantAsync(n, ct)) { await State(n, lease, "Cancelled", ct); continue; }
-                if (!connections.IsCurrent(id, connection) || connection.LastAssistantAudioAt > DateTime.UtcNow.AddSeconds(-2)) continue;
+                if (!connections.IsCurrent(id, connection) || connection.MeetingModeActive
+                    || connection.LastAssistantAudioAt > DateTime.UtcNow.AddSeconds(-2)) continue;
                 var expiry = Math.Min(n.ExpiresInSeconds, (int)(n.ExpiresAt - DateTime.UtcNow).TotalSeconds);
                 if (expiry < 1) { await State(n, lease, "Expired", ct); continue; }
                 var frames = NotificationProtocol.Frames(n.Id, n.Kind, expiry, pcm);

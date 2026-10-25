@@ -63,4 +63,5 @@ public interface IAudioStreamCoordinator
 public interface IConversationAttachmentGateway
 {
     bool IsActive(string agentSessionId);
+    Task SendUserTextAsync(string agentSessionId, string text, CancellationToken cancellationToken);
 }

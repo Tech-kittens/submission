@@ -10,6 +10,7 @@ public sealed class DeviceConnection(WebSocket socket, CancellationToken hostTok
 {
     public string? PendingBriefingNotificationId { get; set; }
     public bool AudioActive { get; set; }
+    public bool MeetingModeActive { get; set; }
     public DateTime LastAssistantAudioAt { get; set; }
     public string? SessionId { get; set; }
     public string Id { get; } = Guid.NewGuid().ToString("N");
