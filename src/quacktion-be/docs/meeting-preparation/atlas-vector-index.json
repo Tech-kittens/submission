@@ -1,0 +1,46 @@
+{
+  "name": "meeting_memory_vector",
+  "type": "vectorSearch",
+  "definition": {
+    "fields": [
+      {
+        "type": "vector",
+        "path": "Embedding",
+        "numDimensions": 768,
+        "similarity": "cosine"
+      },
+      {
+        "type": "filter",
+        "path": "OwnerAccountId"
+      },
+      {
+        "type": "filter",
+        "path": "Active"
+      },
+      {
+        "type": "filter",
+        "path": "ParticipantEmails"
+      },
+      {
+        "type": "filter",
+        "path": "Type"
+      },
+      {
+        "type": "filter",
+        "path": "MeetingType"
+      },
+      {
+        "type": "filter",
+        "path": "MeetingDate"
+      },
+      {
+        "type": "filter",
+        "path": "EmbeddingModel"
+      },
+      {
+        "type": "filter",
+        "path": "EmbeddingDimensions"
+      }
+    ]
+  }
+}

@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Quacktion · MCP auth tester</title>
+<style>
+  :root { color-scheme: light; font: 16px/1.5 system-ui, sans-serif; color: #18332e; background: #f3f6f3; }
+  body { max-width: 820px; margin: 3rem auto; padding: 0 1rem; }
+  h1 { margin-bottom: .3rem; } h2 { margin-top: 0; font-size: 1.15rem; }
+  section { background: white; border: 1px solid #d6e0da; border-radius: 12px; padding: 1.3rem; margin: 1rem 0; }
+  label { display: block; margin: .8rem 0; } input, select { display: block; box-sizing: border-box; width: 100%; padding: .65rem; border: 1px solid #9bafa4; border-radius: 6px; font: inherit; }
+  button, .link { display: inline-block; font: inherit; padding: .55rem .85rem; margin: .3rem .3rem .3rem 0; border: 0; border-radius: 6px; background: #176049; color: white; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; } a { color: #176049; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 350px; overflow: auto; background: #eef3ef; padding: 1rem; border-radius: 6px; }
+  .connection { border-top: 1px solid #d6e0da; padding: 1rem 0; } .connection p { margin: .25rem 0; }
+  #status { min-height: 1.5rem; } [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<h1>MCP auth tester</h1>
+<p>Connect your Quacktion account to an MCP provider and check the connection.</p>
+<p id="origin"></p>
+<section>
+<h2>1. Sign in to Quacktion</h2>
+<form id="loginForm">
+<label>Email<input id="email" type="email" autocomplete="username" required></label>
+<label>Password<input id="password" type="password" autocomplete="current-password" required></label>
+<button type="submit">Log in</button><button id="clear" type="button">Clear local login</button>
+</form>
+<details><summary>Or use an existing account access token</summary>
+<label>Bearer token<input id="token" type="password" autocomplete="off" spellcheck="false"></label>
+<button id="useToken">Use token</button></details>
+<p>Credentials stay in this page’s memory and are cleared on reload.</p>
+</section>
+<section>
+<h2>2. Authorize a provider</h2>
+<label>Provider<select id="provider" disabled><option>Sign in to load providers</option></select></label>
+<button id="connect" disabled>Prepare authorization</button>
+<p id="authorization" hidden><a id="authorizeLink" class="link" target="_blank" rel="noopener noreferrer">Open authorization ↗</a><br>Finish authorization in the new tab. The backend displays a completion page after saving the connection; return here and refresh connections.</p>
+</section>
+<section>
+<h2>3. Check connections</h2>
+<button id="refresh" disabled>Refresh connections</button>
+<div id="connections">Sign in to see connections.</div>
+</section>
+<p id="status" role="status" aria-live="polite">Not signed in.</p>
+<details id="resultPanel"><summary>Response details</summary><pre id="result">No requests yet.</pre></details>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+let accessToken = '', busy = false;
+const hosted = ['http:', 'https:'].includes(location.protocol);
+$('origin').textContent = hosted ? `Backend: ${location.origin}` : 'Open this page through the backend at /mcp-test.html, not as a local file.';
+function controls() {
+  document.querySelectorAll('button').forEach(button => button.disabled = busy || !hosted);
+  $('connect').disabled = busy || !accessToken || !$('provider').value;
+  $('refresh').disabled = busy || !accessToken;
+  $('provider').disabled = busy || !accessToken;
+}
+function reset() {
+  accessToken = '';
+  $('password').value = $('token').value = '';
+  $('provider').replaceChildren();
+  $('connections').textContent = 'Sign in to see connections.';
+  $('authorization').hidden = true;
+  $('authorizeLink').removeAttribute('href');
+  $('result').textContent = 'No requests yet.';
+  $('status').textContent = 'Not signed in.';
+  controls();
+}
+async function api(path, method = 'GET', body, authenticated = true) {
+  const headers = { Accept: 'application/json' };
+  if (authenticated) headers.Authorization = `Bearer ${accessToken}`;
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  let response;
+  try {
+    response = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+      credentials: 'omit', cache: 'no-store', redirect: 'error', signal: AbortSignal.timeout(30000) });
+  } catch { throw new Error('Request failed or timed out. Check the backend connection and logs.'); }
+  const text = await response.text();
+  let data;
+  try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+  if (!response.ok) {
+    if (response.status === 401) reset();
+    // Only show structured API errors, never raw HTML responses or auth payloads.
+    const code = [data?.title, data?.code, data?.error].find(value => typeof value === 'string') || response.statusText;
+    const traceId = typeof data?.traceId === 'string' ? data.traceId : undefined;
+    const hints = {
+      mcp_not_enabled: 'Set Mcp__Enabled=true on the backend serving this page, then restart it.',
+      account_inactive: 'This account is missing or inactive in the backend database.',
+      duplicate_key: 'The database rejected a duplicate record. Check its indexes and the backend logs.',
+      mcp_oauth_failed: 'The MCP server rejected OAuth discovery, registration, or token exchange. Check the backend logs.',
+      mcp_oauth_client_id_required: 'Configure Mcp__OAuthClientId; this server does not advertise dynamic client registration.'
+    };
+    show({ method, path, status: response.status, code, traceId, hint: hints[code],
+      ...(data?.errors && typeof data.errors === 'object' ? { errors: data.errors } : {}) });
+    throw new Error(`${method} ${path}: HTTP ${response.status} ${code}${hints[code] ? ' — ' + hints[code] : ''}`);
+  }
+  return data;
+}
+function show(data) {
+  $('result').textContent = JSON.stringify(data, null, 2);
+  $('resultPanel').open = true;
+}
+async function run(action) {
+  if (busy) return;
+  busy = true; controls(); $('status').textContent = 'Working…';
+  try { await action(); } catch (error) { $('status').textContent = error.message; }
+  finally { busy = false; controls(); }
+}
+async function refresh() {
+  const connections = await api('/api/mcp/connections');
+  $('connections').replaceChildren();
+  if (!connections.length) $('connections').textContent = 'No connections yet. Complete authorization, then refresh.';
+  for (const connection of connections) {
+    const card = document.createElement('div'); card.className = 'connection';
+    const title = document.createElement('strong');
+    title.textContent = connection.displayName || connection.providerAccountId || connection.provider;
+    const detail = document.createElement('p'); detail.textContent = `${connection.provider} · ${connection.status}`;
+    card.append(title, detail);
+    for (const [label, suffix] of [['Check health', 'health'], ['List tools', 'tools']]) {
+      const button = document.createElement('button'); button.textContent = label;
+      button.onclick = () => run(async () => {
+        show(await api(`/api/mcp/connections/${encodeURIComponent(connection.id)}/${suffix}`));
+        $('status').textContent = `${label} succeeded.`;
+      });
+      card.append(button);
+    }
+    $('connections').append(card);
+  }
+  $('status').textContent = `Loaded ${connections.length} connection(s).`;
+}
+async function load() {
+  const providers = await api('/api/mcp/providers');
+  $('provider').replaceChildren();
+  for (const provider of providers) $('provider').add(new Option(provider.displayName, provider.id));
+  await refresh();
+  if (!providers.length) $('status').textContent = 'No providers configured on this backend.';
+}
+$('loginForm').onsubmit = event => {
+  event.preventDefault();
+  const email = $('email').value.trim(), password = $('password').value;
+  run(async () => {
+    reset();
+    const auth = await api('/api/auth/login', 'POST', { email, password }, false);
+    if (!auth?.accessToken) throw new Error('Login returned no access token.');
+    accessToken = auth.accessToken;
+    await load();
+  });
+};
+$('useToken').onclick = () => {
+  const token = $('token').value.trim().replace(/^Bearer\s+/i, '');
+  run(async () => { reset(); if (!token) throw new Error('Enter an account access token.'); accessToken = token; await load(); });
+};
+$('clear').onclick = reset;
+$('refresh').onclick = () => run(refresh);
+$('connect').onclick = () => run(async () => {
+  $('authorization').hidden = true;
+  const result = await api(`/api/mcp/connections/${encodeURIComponent($('provider').value)}/connect`, 'POST');
+  const url = new URL(result.authorizationUrl);
+  if (url.protocol !== 'https:' || url.username || url.password) throw new Error('Backend returned an invalid authorization URL.');
+  $('authorizeLink').href = url.href;
+  $('authorization').hidden = false;
+  $('status').textContent = 'Authorization ready. Open the link above to continue.';
+});
+controls();
+</script>
+</body>
+</html>

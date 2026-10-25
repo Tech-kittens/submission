@@ -59,12 +59,12 @@ var lastAudio = DateTime.UtcNow;
 var gotAudio = false;
 var endedResponse = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
 var receive = ReceiveAudioAsync(socket, writer, () => { gotAudio = true; lastAudio = DateTime.UtcNow; }, endedResponse, stop.Token);
-var chunkBytes = Math.Max(320, wav.SampleRate * wav.Channels * 2 / 10); // at most 100 ms per device frame
+var chunkBytes = Math.Max(320, wav.SampleRate * wav.Channels * 2 * 30 / 1000); // 30 ms per device frame
 for (var offset = 0; offset < wav.Audio.Length; offset += chunkBytes)
 {
     var count = Math.Min(chunkBytes, wav.Audio.Length - offset);
     await socket.SendAsync(wav.Audio.AsMemory(offset, count), WebSocketMessageType.Binary, true, stop.Token);
-    await Task.Delay(TimeSpan.FromMilliseconds(100d * count / chunkBytes), stop.Token);
+    await Task.Delay(TimeSpan.FromMilliseconds(30d * count / chunkBytes), stop.Token);
 }
 
 var outputDeadline = DateTime.UtcNow.AddSeconds(25);

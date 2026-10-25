@@ -1,0 +1,37 @@
+{
+  "name": "meeting_memory_text",
+  "definition": {
+    "mappings": {
+      "dynamic": false,
+      "fields": {
+        "OwnerAccountId": {
+          "type": "token"
+        },
+        "ParticipantEmails": {
+          "type": "token"
+        },
+        "Type": {
+          "type": "token"
+        },
+        "MeetingType": {
+          "type": "token"
+        },
+        "Content": {
+          "type": "string"
+        },
+        "MeetingTitle": {
+          "type": "string"
+        },
+        "Topics": {
+          "type": "string"
+        },
+        "Active": {
+          "type": "boolean"
+        },
+        "MeetingDate": {
+          "type": "date"
+        }
+      }
+    }
+  }
+}

@@ -12,9 +12,78 @@ public sealed class SessionService(
     IDeviceConnectionManager connections,
     ISessionEvents events,
     ILogger<SessionService> logger,
-    ISessionAudioConnectionManager? sessionAudioConnections = null
+    ISessionAudioConnectionManager? sessionAudioConnections = null,
+    IConversationPersistence? persistence = null
 ) : ISessionService
 {
+    public async Task<Session> SelectResumeAsync(string owner, string id, CancellationToken ct)
+    {
+        var session = await GetAsync(owner, id, ct);
+        Guard.State(session.Status is SessionStatus.Active or SessionStatus.Suspended or SessionStatus.Completed, "session_not_resumable");
+        if (persistence is not null && await persistence.IsLeasedAsync(owner, id, ct)) throw new AppException(409, "conversation_in_use");
+        if (session.DeviceId is { } deviceId)
+        {
+            var device = await OwnedDevice(owner, deviceId, ct);
+            Guard.State(device.ActiveSessionId is null || device.ActiveSessionId == id, "device_busy");
+            device.ActiveSessionId = id;
+            await Guard.Save(devices, device, ct);
+        }
+        session.Status = SessionStatus.Suspended;
+        session.EndedAt = null;
+        session.AgentSessionId = null;
+        await Save(session, ct);
+        await Publish(session, ct);
+        return session;
+    }
+
+    public async Task<Session> ResumeAsync(string owner, string id, CancellationToken ct)
+    {
+        var session = await GetAsync(owner, id, ct);
+        Guard.State(session.Status is SessionStatus.Active or SessionStatus.Suspended or SessionStatus.Starting or SessionStatus.Connecting, "session_not_resumable");
+        // A live provider lease belongs to another transport; never steal it.
+        if (persistence is not null && await persistence.IsLeasedAsync(owner, id, ct))
+            throw new AppException(409, "conversation_in_use");
+        if (session.DeviceId is { } deviceId)
+        {
+            var device = await OwnedDevice(owner, deviceId, ct);
+            Guard.State(device.ActiveSessionId is null || device.ActiveSessionId == id, "device_busy");
+            if (device.ActiveSessionId is null) { device.ActiveSessionId = id; await Guard.Save(devices, device, ct); }
+        }
+        var result = await voice.StartSessionAsync(new(id, owner), ct);
+        try
+        {
+            // Provider startup can flush durable transcript events, so reload before the CAS.
+            session = await GetAsync(owner, id, ct);
+            Guard.State(session.EndedAt is null && session.Status is not SessionStatus.Ending, "session_ended");
+            session.AgentSessionId = result.AgentSessionId;
+            session.Status = SessionStatus.Active;
+            session.DisconnectedAt = null;
+            session.FailureCode = null;
+            await Save(session, ct);
+            await Publish(session, ct);
+            return session;
+        }
+        catch { await voice.EndSessionAsync(result.AgentSessionId, CancellationToken.None); throw; }
+    }
+
+    public async Task SuspendAsync(string owner, string id, string? expectedAgentId, CancellationToken ct)
+    {
+        var session = await GetAsync(owner, id, ct);
+        if (session.Status != SessionStatus.Active || session.AgentSessionId != expectedAgentId) return;
+        // Keep the provider lease until it has stopped and transcript writes have drained.
+        if (expectedAgentId is not null) await voice.EndSessionAsync(expectedAgentId, ct);
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            session = await GetAsync(owner, id, ct);
+            if (session.Status != SessionStatus.Active || session.AgentSessionId != expectedAgentId) return;
+            session.Status = SessionStatus.Suspended;
+            session.DisconnectedAt = DateTime.UtcNow;
+            session.UpdatedAt = DateTime.UtcNow;
+            session.AgentSessionId = null;
+            if (await sessions.ReplaceAsync(session, ct)) { await Publish(session, ct); return; }
+        }
+    }
+
     public async Task<Session> CreateAsync(string owner, SessionRequest request, CancellationToken ct)
     {
         ValidateRequest(request, requirePrompt: false);
@@ -43,8 +112,7 @@ public sealed class SessionService(
 
         if (request.DeviceId is not null)
         {
-            await OwnedDevice(owner, request.DeviceId, ct);
-            var device = await devices.GetAsync(request.DeviceId, ct);
+            var device = await RecoverDeviceReservation(owner, request.DeviceId, ct);
             Guard.State(device?.ActiveSessionId is null, "device_busy");
         }
 
@@ -67,27 +135,28 @@ public sealed class SessionService(
         return await StartAsync(owner, session.Id, request.InitialPrompt, request.PromptFormat, requestId, ct);
     }
 
-    public async Task<SessionAudioStartResult> CreateAudioSessionAsync(string deviceId, string requestId, string name, int connectionWindowSeconds, CancellationToken ct)
+    public async Task<SessionAudioStartResult> CreateAudioSessionAsync(string owner, string? deviceId, string requestId, string name, int connectionWindowSeconds, CancellationToken ct)
     {
         Guard.Input(!string.IsNullOrWhiteSpace(requestId) && requestId.Length <= 200, "invalid_request_id");
         Guard.Input(!string.IsNullOrWhiteSpace(name) && name.Length <= 200, "invalid_session_name");
         Guard.Input(connectionWindowSeconds is >= 10 and <= 300, "invalid_connection_window");
 
-        var device = Guard.Found(await devices.GetAsync(deviceId, ct));
-        Guard.State(device.CredentialHash is not null, "device_unpaired");
-        var existing = await sessions.FindAsync(s => s.OwnerAccountId == device.OwnerAccountId && s.DeviceId == deviceId && s.StartRequestId == requestId, ct);
+        var device = deviceId is null ? null : await RecoverDeviceReservation(owner, deviceId, ct);
+        if (device is not null)
+            Guard.Input(device.OwnerAccountId == owner && device.CredentialHash is not null, "invalid_device_credentials");
+        var existing = await sessions.FindAsync(s => s.OwnerAccountId == owner && s.DeviceId == deviceId && s.StartRequestId == requestId, ct);
         if (existing is not null)
         {
             if (existing.Status != SessionStatus.Ready || existing.ConnectionCredentialConsumedAt is not null)
                 throw new AppException(409, "session_start_already_consumed");
-            return await RefreshAudioSessionAsync(existing, connectionWindowSeconds, ct);
+            return await RefreshAudioSessionAsync(existing, ct);
         }
-        Guard.State(device.ActiveSessionId is null, "device_busy");
+        if (device is not null) Guard.State(device.ActiveSessionId is null, "device_busy");
 
         var now = DateTime.UtcNow;
         var session = new Session
         {
-            OwnerAccountId = device.OwnerAccountId,
+            OwnerAccountId = owner,
             DeviceId = deviceId,
             Title = name,
             Status = SessionStatus.Ready,
@@ -98,32 +167,37 @@ public sealed class SessionService(
         try { await sessions.InsertAsync(session, ct); }
         catch (AppException e) when (e.Code == "duplicate_key")
         {
-            var duplicate = await sessions.FindAsync(s => s.OwnerAccountId == device.OwnerAccountId && s.DeviceId == deviceId && s.StartRequestId == requestId, ct);
+            var duplicate = await sessions.FindAsync(s => s.OwnerAccountId == owner && s.DeviceId == deviceId && s.StartRequestId == requestId, ct);
             if (duplicate is null) throw;
-            return await RefreshAudioSessionAsync(duplicate, connectionWindowSeconds, ct);
+            return await RefreshAudioSessionAsync(duplicate, ct);
         }
-        try
+        if (device is not null)
         {
-            device.ActiveSessionId = session.Id;
-            await Guard.Save(devices, device, ct);
-            return new(session, connectionWindowSeconds);
+            try
+            {
+                device.ActiveSessionId = session.Id;
+                await Guard.Save(devices, device, ct);
+            }
+            catch
+            {
+                await sessions.DeleteAsync(session, CancellationToken.None);
+                throw;
+            }
         }
-        catch
-        {
-            await sessions.DeleteAsync(session, CancellationToken.None);
-            throw;
-        }
+        return new(session, connectionWindowSeconds);
     }
 
-    public async Task<Session> ConnectAccountDeviceSessionAsync(string sessionId, string owner, CancellationToken ct)
+    public async Task<Session> ConnectAccountSessionAsync(string sessionId, string owner, string? deviceId, CancellationToken ct)
     {
-        var session = await sessions.ConsumeOwnedConnectionAsync(sessionId, owner, DateTime.UtcNow, ct);
-        if (session?.DeviceId is null) throw new AppException(401, "invalid_or_expired_session_credential");
-        var deviceId = session.DeviceId;
+        var prior = await sessions.GetAsync(sessionId, ct);
+        if (prior?.OwnerAccountId == owner && (deviceId is null || prior.DeviceId == deviceId) &&
+            (prior.Status == SessionStatus.Suspended || prior.Status == SessionStatus.Active && persistence is not null &&
+                prior.UpdatedAt <= DateTime.UtcNow.AddSeconds(-75) && !await persistence.IsLeasedAsync(owner, sessionId, ct)))
+            return await ResumeAsync(owner, sessionId, ct);
+        var session = await sessions.ConsumeOwnedConnectionAsync(sessionId, owner, deviceId, DateTime.UtcNow, ct);
+        if (session is null) throw new AppException(401, "invalid_session_connection");
         try
         {
-            var device = Guard.Found(await devices.FindAsync(d => d.Id == deviceId && d.OwnerAccountId == session.OwnerAccountId, ct));
-            Guard.State(device.ActiveSessionId == session.Id && device.CredentialHash is not null, "device_session_unavailable");
             await Publish(session, ct);
             await events.PublishAsync(session.OwnerAccountId, session.Id, "AgentStatusChanged", new { Status = "Connecting" }, ct);
             var result = await voice.StartSessionAsync(new(session.Id, session.OwnerAccountId), ct);
@@ -152,20 +226,28 @@ public sealed class SessionService(
         }
     }
 
-    private async Task<SessionAudioStartResult> RefreshAudioSessionAsync(Session session, int lifetimeSeconds, CancellationToken ct)
+    private async Task<SessionAudioStartResult> RefreshAudioSessionAsync(Session session, CancellationToken ct)
     {
-        var device = Guard.Found(await devices.GetAsync(session.DeviceId!, ct));
-        Guard.State(device.OwnerAccountId == session.OwnerAccountId && device.CredentialHash is not null, "device_session_unavailable");
-        Guard.State(device.ActiveSessionId is null || device.ActiveSessionId == session.Id, "device_busy");
-        if (device.ActiveSessionId is null)
+        Guard.State(session.Status == SessionStatus.Ready && session.ConnectionCredentialConsumedAt is null,
+            "session_start_already_consumed");
+        if (session.ConnectionCredentialExpiresAt is not { } expires || expires <= DateTime.UtcNow)
         {
-            device.ActiveSessionId = session.Id;
-            await Guard.Save(devices, device, ct);
+            await ExpireReadyAsync(session.OwnerAccountId, session.Id, ct);
+            throw new AppException(409, "connection_window_expired");
         }
-        session.ConnectionCredentialConsumedAt = null;
-        session.ConnectionCredentialExpiresAt = DateTime.UtcNow.AddSeconds(lifetimeSeconds);
-        await Save(session, ct);
-        return new(session, lifetimeSeconds);
+        if (session.DeviceId is not null)
+        {
+            var device = Guard.Found(await devices.GetAsync(session.DeviceId, ct));
+            Guard.State(device.OwnerAccountId == session.OwnerAccountId && device.CredentialHash is not null, "device_session_unavailable");
+            Guard.State(device.ActiveSessionId is null || device.ActiveSessionId == session.Id, "device_busy");
+            if (device.ActiveSessionId is null)
+            {
+                device.ActiveSessionId = session.Id;
+                await Guard.Save(devices, device, ct);
+            }
+        }
+        // A retry must not extend the connection deadline or overwrite a concurrent connection claim.
+        return new(session, Math.Max(1, (int)Math.Ceiling((expires - DateTime.UtcNow).TotalSeconds)));
     }
 
     public async Task<Session> GetAsync(string owner, string id, CancellationToken ct) =>
@@ -234,7 +316,7 @@ public sealed class SessionService(
         {
             if (session.DeviceId is not null)
             {
-                var device = await OwnedDevice(owner, session.DeviceId, ct);
+                var device = await RecoverDeviceReservation(owner, session.DeviceId, ct);
                 Guard.State(device.CredentialHash is not null, "device_unpaired");
                 Guard.State(device.ActiveSessionId is null || device.ActiveSessionId == session.Id, "device_busy");
                 device.ActiveSessionId = session.Id;
@@ -273,7 +355,19 @@ public sealed class SessionService(
     public async Task<Session> EndAsync(string owner, string id, CancellationToken ct, string? requestId = null)
     {
         var session = await GetAsync(owner, id, ct);
-        Guard.State(session.Status == SessionStatus.Active);
+        if (session.Status == SessionStatus.Completed)
+            return session;
+        if (session.Status == SessionStatus.Ready)
+        {
+            session.Status = SessionStatus.Completed;
+            session.EndedAt = DateTime.UtcNow;
+            await Save(session, ct);
+            await ReleaseDevice(session, ct);
+            await Publish(session, ct);
+            await events.PublishAsync(owner, id, "AgentStatusChanged", new { Status = "Disconnected" }, ct);
+            return session;
+        }
+        Guard.State(session.Status is SessionStatus.Active or SessionStatus.Suspended);
         session.Status = SessionStatus.Ending;
         await Save(session, ct);
         await Publish(session, ct);
@@ -290,19 +384,21 @@ public sealed class SessionService(
             session.FailureCode = "voice_shutdown_failed";
             logger.LogWarning("Session shutdown failed {SessionId} {ErrorType}", id, e.GetType().Name);
         }
-        session.EndedAt = DateTime.UtcNow;
-        await Save(session, cleanup.Token);
+        // The provider may flush final transcripts while shutting down. Transcript
+        // persistence also updates the meeting document, so reload it before the
+        // terminal lifecycle save to avoid a stale-version concurrency conflict.
+        var latest = await sessions.GetAsync(id, cleanup.Token);
+        if (latest is null || latest.OwnerAccountId != owner)
+            throw new AppException(404, "session_not_found");
+        if (latest.Status != SessionStatus.Ending)
+            return latest;
+        latest.Status = session.Status;
+        latest.FailureCode = session.FailureCode;
+        latest.EndedAt = DateTime.UtcNow;
+        await Save(latest, cleanup.Token);
+        session = latest;
         await ReleaseDevice(session, cleanup.Token);
-        if (session.DeviceId is not null)
-        {
-            var control = JsonSerializer.SerializeToUtf8Bytes(new { version = 1, type = "session.ended", requestId, payload = new { sessionId = session.Id, status = session.Status.ToString() } });
-            try
-            {
-                var sentToSessionSocket = sessionAudioConnections is not null && await sessionAudioConnections.SendControlAsync(session.Id, control, cleanup.Token);
-                if (!sentToSessionSocket) await connections.SendTextAsync(session.DeviceId, control, cleanup.Token);
-            }
-            catch (Exception e) { logger.LogDebug("Device end notification skipped {SessionId} {ErrorType}", id, e.GetType().Name); }
-        }
+        await NotifyTerminal(session, requestId, cleanup.Token);
         await Publish(session, cleanup.Token);
         await events.PublishAsync(owner, id, "AgentStatusChanged", new { Status = "Disconnected" }, cleanup.Token);
         return session;
@@ -312,7 +408,7 @@ public sealed class SessionService(
     {
         var session = await GetAsync(owner, id, ct);
         if (session.Status == SessionStatus.Failed) return session;
-        Guard.State(session.Status is SessionStatus.Active or SessionStatus.Connecting or SessionStatus.Ready, "invalid_session_state");
+        Guard.State(session.Status is SessionStatus.Active or SessionStatus.Connecting or SessionStatus.Ready or SessionStatus.Ending, "invalid_session_state");
         session.Status = SessionStatus.Failed;
         session.FailureCode = failureCode;
         session.EndedAt = DateTime.UtcNow;
@@ -324,9 +420,25 @@ public sealed class SessionService(
             catch (Exception e) { logger.LogWarning("Failed session provider cleanup {SessionId} {ErrorType}", id, e.GetType().Name); }
         }
         await ReleaseDevice(session, cleanup.Token);
+        await NotifyTerminal(session, null, cleanup.Token);
         await Publish(session, cleanup.Token);
         await events.PublishAsync(owner, id, "AgentStatusChanged", new { Status = "Disconnected" }, cleanup.Token);
         return session;
+    }
+
+    public async Task<bool> ExpireReadyAsync(string owner, string id, CancellationToken ct)
+    {
+        var session = await GetAsync(owner, id, ct);
+        if (session.Status != SessionStatus.Ready || (session.ConnectionCredentialExpiresAt is { } expires
+            ? expires > DateTime.UtcNow : session.UpdatedAt > DateTime.UtcNow.AddMinutes(-2))) return false;
+        session.Status = SessionStatus.Failed;
+        session.FailureCode = "connection_window_expired";
+        session.EndedAt = session.UpdatedAt = DateTime.UtcNow;
+        // CAS against the Ready version prevents expiration from terminating a connection that just claimed it.
+        if (!await sessions.ReplaceAsync(session, ct)) return false;
+        await ReleaseDevice(session, ct);
+        await Publish(session, ct);
+        return true;
     }
 
     private async Task<Session> ResolveExistingStart(Session session, string requestId, CancellationToken ct)
@@ -338,6 +450,7 @@ public sealed class SessionService(
             return await WaitForStart(session.Id, requestId, ct);
         if (session.Status == SessionStatus.Failed)
             throw new AppException(502, session.FailureCode ?? "session_start_failed");
+        Guard.State(session.Status is SessionStatus.Active or SessionStatus.Suspended, "session_start_already_consumed");
         return session;
     }
 
@@ -351,6 +464,8 @@ public sealed class SessionService(
             if (session.StartRequestId != requestId)
                 throw new AppException(409, "idempotency_key_conflict");
             if (session.Status == SessionStatus.Active || session.Status == SessionStatus.Completed)
+                return session;
+            if (session.Status == SessionStatus.Suspended)
                 return session;
             if (session.Status == SessionStatus.Failed)
                 throw new AppException(502, session.FailureCode ?? "session_start_failed");
@@ -381,6 +496,43 @@ public sealed class SessionService(
 
     private async Task<Device> OwnedDevice(string owner, string id, CancellationToken ct) =>
         Guard.Found(await devices.FindAsync(d => d.Id == id && d.OwnerAccountId == owner, ct));
+
+    private async Task<Device> RecoverDeviceReservation(string owner, string id, CancellationToken ct)
+    {
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            var device = await OwnedDevice(owner, id, ct);
+            if (device.ActiveSessionId is null) return device;
+            var reserved = await sessions.GetAsync(device.ActiveSessionId, ct);
+            if (reserved is { Status: SessionStatus.Ready } && reserved.OwnerAccountId == owner && reserved.DeviceId == id
+                && (reserved.ConnectionCredentialExpiresAt is { } expires ? expires <= DateTime.UtcNow : reserved.UpdatedAt <= DateTime.UtcNow.AddMinutes(-2)))
+            {
+                await ExpireReadyAsync(owner, reserved.Id, ct);
+                continue;
+            }
+            if (reserved is not null && reserved.Status is not (SessionStatus.Completed or SessionStatus.Failed)) return device;
+            device.ActiveSessionId = null;
+            if (await devices.ReplaceAsync(device, ct)) return device;
+        }
+        throw new AppException(409, "device_busy");
+    }
+
+    private async Task NotifyTerminal(Session session, string? requestId, CancellationToken ct)
+    {
+        var failed = session.Status == SessionStatus.Failed;
+        var control = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            version = 1, type = failed ? "session.failed" : "session.ended", requestId,
+            payload = new { sessionId = session.Id, status = session.Status.ToString(),
+                reason = failed ? session.FailureCode : "completed", code = failed ? session.FailureCode : null }
+        });
+        try
+        {
+            var sent = sessionAudioConnections is not null && await sessionAudioConnections.SendControlAsync(session.Id, control, ct);
+            if (!sent && session.DeviceId is not null) await connections.SendTextAsync(session.DeviceId, control, ct);
+        }
+        catch (Exception e) { logger.LogDebug("Session terminal notification skipped {SessionId} {ErrorType}", session.Id, e.GetType().Name); }
+    }
 
     private async Task ReleaseDevice(Session session, CancellationToken ct)
     {

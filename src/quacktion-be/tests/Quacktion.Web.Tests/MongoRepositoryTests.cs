@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Options;
+using MongoDB.Bson;
 using MongoDB.Driver;
 using Quacktion.App.Models;
 using Quacktion.App.Services;
@@ -14,6 +15,25 @@ public sealed class MongoFactAttribute : FactAttribute
 }
 public sealed class MongoRepositoryTests
 {
+    [Fact]
+    public void SessionReadsLegacyDocumentsWithRemovedCredentialHash()
+    {
+        _ = new MongoDbContext(Options.Create(new MongoDbSettings()));
+        var document = new BsonDocument
+        {
+            ["_id"] = "legacy-session",
+            ["OwnerAccountId"] = "owner",
+            ["Title"] = "Previous conversation",
+            ["Status"] = (int)SessionStatus.Completed,
+            ["ConnectionCredentialHash"] = "legacy-secret"
+        };
+
+        var session = MongoDB.Bson.Serialization.BsonSerializer.Deserialize<Session>(document);
+
+        Assert.Equal("legacy-session", session.Id);
+        Assert.Equal(SessionStatus.Completed, session.Status);
+    }
+
     [MongoFact]
     public async Task UniqueIndexesSecretsCasClaimsRenewalFencingAndAuditProjections()
     {
@@ -40,6 +60,22 @@ public sealed class MongoRepositoryTests
             claimed.Status = QuacktionStatus.Completed; claimed.History[^1].FinishedAt = DateTime.UtcNow; Assert.True(await repo.FinishAsync(claimed, claimed.LeaseId!, default));
             var finished = (await repo.GetAsync(claimed.Id, default))!; Assert.Equal(QuacktionStatus.Cancelled, finished.Status);
             await repo.SyncAuditAsync(finished, default); Assert.Equal(1, await db.Collection<QuacktionExecution>().CountDocumentsAsync(x => x.QuacktionId == action.Id));
+            var approvalAction = new TaskAction
+            {
+                Id = "approval-projection-test",
+                OwnerAccountId = account.Id,
+                Status = QuacktionStatus.PendingApproval,
+                ActionType = "mcp.request",
+                Approval = new ApprovalRequest { Id = "embedded-approval-id", QuacktionId = "approval-projection-test",
+                    OwnerAccountId = account.Id, ActionDigest = "digest", Status = ApprovalStatus.Pending }
+            };
+            await repo.InsertAsync(approvalAction, default);
+            await db.Collection<ApprovalRequest>().InsertOneAsync(new ApprovalRequest { Id = "legacy-approval-id",
+                QuacktionId = approvalAction.Id, OwnerAccountId = account.Id, ActionDigest = "old-digest" });
+            await repo.SyncAuditAsync(approvalAction, default);
+            await repo.SyncAuditAsync(approvalAction, default);
+            Assert.Equal(1, await db.Collection<ApprovalRequest>().CountDocumentsAsync(x => x.QuacktionId == approvalAction.Id));
+            Assert.Equal("digest", (await db.Collection<ApprovalRequest>().Find(x => x.QuacktionId == approvalAction.Id).SingleAsync()).ActionDigest);
             var recovery = new TaskAction { Status = QuacktionStatus.Queued }; await repo.InsertAsync(recovery, default);
             var expired = (await repo.ClaimAsync(DateTime.UtcNow.AddMinutes(-1), TimeSpan.FromSeconds(1), default));
             // A fresh queued document is not eligible in the past; claim it now, then explicitly expire its lease.

@@ -18,10 +18,21 @@ public interface IDeviceRepo : IRepository<Device>;
 public interface IPairingChallengeRepo : IRepository<PairingChallenge>;
 public interface ISessionRepo : IRepository<Session>
 {
-    Task<Session?> ConsumeOwnedConnectionAsync(string sessionId, string ownerId, DateTime now, CancellationToken ct);
+    Task<Session?> ConsumeOwnedConnectionAsync(string sessionId, string ownerId, string? deviceId, DateTime now, CancellationToken ct);
 }
-public interface ITranscriptRepo : IRepository<TranscriptEntry>;
+public interface ITranscriptRepo : IRepository<TranscriptEntry>
+{
+    Task<IReadOnlyList<TranscriptEntry>> RecentAsync(string sessionId, int limit, CancellationToken ct);
+}
 public interface IAgentRepo : IRepository<Agent>;
+public interface IRealtimeStateRepo : IRepository<RealtimeState>;
+public interface IMeetingToolCallRepo : IRepository<MeetingToolCall>;
+public interface IMcpServerRegistrationRepo : IRepository<McpServerRegistration>;
+public interface IUserMcpConnectionRepo : IRepository<UserMcpConnection>;
+public interface IMcpCredentialRepo : IRepository<McpCredential>;
+public interface IMcpOAuthTransactionRepo : IRepository<McpOAuthTransaction>;
+public interface IMcpExecutionAuditRepo : IRepository<McpExecutionAudit>;
+public interface IMcpSkillExecutionRepo : IRepository<McpSkillExecution>;
 public interface IQuacktionRepo : IRepository<TaskAction>
 {
     Task<TaskAction?> ClaimAsync(DateTime now, TimeSpan lease, CancellationToken ct);

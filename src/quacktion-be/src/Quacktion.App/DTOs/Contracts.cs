@@ -71,7 +71,8 @@ public record SessionUpdate([Required, MaxLength(200)] string Title);
 
 public record ProposalRequest(
     [Required, MaxLength(128)] string ActionType,
-    [Required, MaxLength(32768)] string ParametersJson
+    [Required, MaxLength(32768)] string ParametersJson,
+    [MaxLength(200)] string? IdempotencyKey = null
 );
 
 public record ApprovalDecision([Required] string ActionDigest);

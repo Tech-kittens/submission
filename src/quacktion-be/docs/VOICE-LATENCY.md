@@ -1,0 +1,27 @@
+# Voice latency investigation and live benchmark
+
+## Findings in this checkout
+
+- The persistent device socket previously queried MongoDB once per PCM frame before forwarding it to Gemini. At 1,280 bytes per frame this adds one database round trip every 40 ms of input audio, serialised with Gemini sends. The active, authenticated stream is already bound at `audio.start`; `audio.stop` and `session.end` cancel its stream token. The per-frame read has been removed.
+- The Gemini connection is reused for the session. Ordinary speech goes directly to Gemini; Jev and Argon run only after a declared function call creates durable work. Gemini output is decoded and queued per chunk, then sent as binary PCM frames. There is no whole-response audio buffer.
+- The Gemini receiver previously awaited function-call persistence before reading the next provider message. Function calls are now journaled on the existing bounded dispatcher while the receiver continues reading audio. A journal barrier runs before reconnection so accepted calls remain recoverable. A regression test injects an 800 ms journal write and confirms the following audio frame reaches the output stream within 500 ms. The dispatcher idle interval was also reduced from 250 ms to 100 ms.
+- A dropped Gemini connection previously waited at least 500 ms before the first reconnect attempt. The first attempt now starts immediately; later attempts still back off. Session resumption remains enabled.
+- The repository contains backend and simulator code but no ESP32 firmware or Railway telemetry. Physical capture, playback, network transit, resource throttling, and live provider delays cannot be measured here.
+
+## Diagnostics
+
+Set `Logging__LogLevel__Quacktion=Debug` only during a benchmark. `VoiceTiming`, `AgentTiming`, and `McpTiming` are structured log events. They contain session/turn IDs, stage names, and durations; no audio, transcripts, OAuth tokens, or tool arguments. The timing source is `Stopwatch`, so all durations remain within one backend process.
+
+`audio_forward` measures backend receipt through successful Gemini send. `gemini_first_audio_after_input_transcription` uses receipt of the *transcription event* as its starting point; it is **not** a measurement of speech endpoint or model inference alone. `provider_audio_to_device_send` (or `provider_audio_to_client_send`) measures first provider chunk receipt through WebSocket send. `jev_route`, `argon_execution`, `connection_setup`, `tool_discovery`, and `tool_execution` cover their named operations. Log lines can be joined by session and turn IDs where provided. A value of `-1` means the starting event was unavailable and must be excluded from aggregates.
+
+For real audio receive and playback latency, firmware needs monotonic capture and playback markers, plus a sequence number sent in optional telemetry. Measure device durations on the device clock and backend durations on the server clock; do not subtract their timestamps. End-to-end speech-end to audible playback requires a device-local speech-end marker and playback-start marker. The current backend protocol does not supply these markers.
+
+## Repeatable live run
+
+1. Deploy a baseline revision and the changed revision to the same Railway service size and region, one at a time. Use the same device, network, Gemini model, MCP account and enabled tools. Save revision, UTC window, and provider configuration with each run. Allow setup and warm-up to finish before sampling.
+2. For each revision, record at least 20 repetitions each of: “Quacktion, hello”; a short factual question without tools; a tomorrow-calendar lookup; a long background task while asking a second question; an approval-required calendar deletion (do not approve unless intended); a 15-minute continuous conversation; and a forced Gemini disconnect. Keep the speaker, microphone distance, pauses, and noise conditions consistent.
+3. For VAD, repeat the speech tests with `Gemini__SilenceDurationMs` of 300, 400, 500, and 800. Record endpoint timing from device markers, first audible playback, false or premature turn ends, and interrupted sentences. Restore 500 ms unless a shorter candidate improves latency without unacceptable cutoffs. The setup tests verify that all four candidate values reach the Live request; they do not establish their acoustic behaviour.
+4. Export the structured logs and device markers. Group samples by revision, scenario, and VAD value; calculate median and nearest-rank P95 from actual durations. Record failure counts and excluded samples. Compare only equivalent conditions. For the calendar case, keep Jev, Argon, MCP discovery, tool execution, and the final spoken response separate. Check that the task acknowledgement does not claim completion.
+5. Preserve the approval audit and inspect session resumption after a forced disconnect. Check Railway CPU, memory, GC, restarts, and network metrics for the same windows before attributing any remaining delay to hosting.
+
+The configured `gemini-3.8-live` model and the `automaticActivityDetection.silenceDurationMs` field are documented by Google's current [model list](https://ai.google.dev/gemini-api/docs/models) and [Live API reference](https://ai.google.dev/api/live). `EnforceEnglish` is applied through the system instruction, while `en-GB` is sent in speech configuration. Input and output transcription, session resumption, and context compression remain enabled pending controlled live comparisons.

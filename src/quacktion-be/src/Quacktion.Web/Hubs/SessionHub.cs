@@ -18,13 +18,14 @@ public sealed class SessionHub(ISessionService sessions, IAccountService account
     }
     public Task LeaveSession(string sessionId) => Groups.RemoveFromGroupAsync(Context.ConnectionId, Group(Context.User!.FindFirstValue(ClaimTypes.NameIdentifier)!, sessionId));
 }
-public sealed class SessionEvents(IHubContext<SessionHub> hub, IAccountRepo accounts, ILogger<SessionEvents> logger) : ISessionEvents
+public sealed class SessionEvents(IHubContext<SessionHub> hub, IAccountRepo accounts, ILogger<SessionEvents> logger, IConversationPersistence? journal = null) : ISessionEvents
 {
     public async Task PublishAsync(string owner, string session, string eventName, object payload, CancellationToken ct)
     {
         try
         {
             if (await accounts.GetAsync(owner, ct) is not { IsActive: true }) return;
+            if (journal is not null) await journal.RecordAsync(owner, session, eventName, payload, ct);
             await hub.Clients.Group(SessionHub.Group(owner, session)).SendAsync(eventName, payload, ct);
         }
         catch (Exception e) { logger.LogWarning("Notification failed {SessionId} {EventName} {ErrorType}", session, eventName, e.GetType().Name); }

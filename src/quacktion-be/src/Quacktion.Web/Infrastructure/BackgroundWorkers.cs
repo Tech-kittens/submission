@@ -1,6 +1,7 @@
 using Quacktion.App.Interfaces;
 using Quacktion.App.Models;
 using Quacktion.Data.MongoDB;
+using Quacktion.Data.Agents;
 using Microsoft.Extensions.Options;
 namespace Quacktion.Web.Infrastructure;
 
@@ -16,13 +17,20 @@ public sealed class DatabaseWorker(IMongoDbContext db, DatabaseReadiness readine
             try
             {
                 await db.InitializeAsync(stoppingToken);
-                using var scope = scopes.CreateScope();
-                var sessions = scope.ServiceProvider.GetRequiredService<ISessionRepo>();
-                while (true)
+                await using var scope = scopes.CreateAsyncScope();
+                // Conversations recover lazily after expired transport leases. Never terminate another replica's sessions.
+                var registry = scope.ServiceProvider.GetRequiredService<IMcpServerRegistry>();
+                var registrations = scope.ServiceProvider.GetRequiredService<IMcpServerRegistrationRepo>();
+                foreach (var server in registry.All())
                 {
-                    var batch = await sessions.ListAsync(s => s.Status == SessionStatus.Starting || s.Status == SessionStatus.Active || s.Status == SessionStatus.Ending, 0, 100, stoppingToken);
-                    if (batch.Count == 0) break;
-                    foreach (var s in batch) { s.Status = SessionStatus.Failed; s.FailureCode = "transport_host_restarted"; s.EndedAt = DateTime.UtcNow; await sessions.ReplaceAsync(s, stoppingToken); }
+                    var record = await registrations.GetAsync(server.Id, stoppingToken);
+                    if (record is null) await registrations.InsertAsync(new McpServerRegistration
+                        { Id = server.Id, Provider = server.Provider, Service = server.Service, Endpoint = server.Endpoint.AbsoluteUri }, stoppingToken);
+                    else
+                    {
+                        record.Endpoint = server.Endpoint.AbsoluteUri; record.UpdatedAt = DateTime.UtcNow;
+                        await registrations.ReplaceAsync(record, stoppingToken);
+                    }
                 }
                 readiness.Ready = true; return;
             }
@@ -42,7 +50,7 @@ public sealed class ExecutionWorker(IServiceScopeFactory scopes, DatabaseReadine
             {
                 if (readiness.Ready)
                 {
-                    using var scope = scopes.CreateScope();
+                    await using var scope = scopes.CreateAsyncScope();
                     if (await scope.ServiceProvider.GetRequiredService<IQuacktionExecutionService>().ExecuteNextAsync(stoppingToken)) continue;
                 }
             }
@@ -63,7 +71,7 @@ public sealed class MaintenanceWorker(IServiceScopeFactory scopes, DatabaseReadi
             {
                 if (readiness.Ready)
                 {
-                    using var scope = scopes.CreateScope(); var sp = scope.ServiceProvider;
+                    await using var scope = scopes.CreateAsyncScope(); var sp = scope.ServiceProvider;
                     var sessions = sp.GetRequiredService<ISessionRepo>(); var devices = sp.GetRequiredService<IDeviceRepo>();
                     var accounts = sp.GetRequiredService<IAccountRepo>(); var actions = sp.GetRequiredService<IQuacktionRepo>();
                     var connections = sp.GetRequiredService<IDeviceConnectionManager>();
@@ -84,9 +92,29 @@ public sealed class MaintenanceWorker(IServiceScopeFactory scopes, DatabaseReadi
                             if (changed) await devices.ReplaceAsync(d, ct);
                         }
                     }
+                    var now = DateTime.UtcNow;
+                    var staleReadyBefore = now.AddMinutes(-2);
+                    while (true)
+                    {
+                        var expiredReady = await sessions.ListAsync(
+                            s => s.Status == SessionStatus.Ready &&
+                                ((s.ConnectionCredentialExpiresAt.HasValue && s.ConnectionCredentialExpiresAt.Value <= now) ||
+                                (!s.ConnectionCredentialExpiresAt.HasValue && s.UpdatedAt <= staleReadyBefore)),
+                            0,
+                            100,
+                            ct
+                        );
+                        if (expiredReady.Count == 0) break;
+                        foreach (var session in expiredReady)
+                            await sp.GetRequiredService<ISessionService>().ExpireReadyAsync(
+                                session.OwnerAccountId,
+                                session.Id,
+                                ct
+                            );
+                    }
                     for (var offset = 0; ; offset += 100)
                     {
-                        var batch = await sessions.ListAsync(s => s.Status == SessionStatus.Active || s.Status == SessionStatus.Starting || s.Status == SessionStatus.Ending, offset, 100, ct);
+                        var batch = await sessions.ListAsync(s => s.Status == SessionStatus.Active || s.Status == SessionStatus.Starting || s.Status == SessionStatus.Connecting || s.Status == SessionStatus.Ending, offset, 100, ct);
                         if (batch.Count == 0) break;
                         foreach (var s in batch)
                         {
@@ -95,10 +123,21 @@ public sealed class MaintenanceWorker(IServiceScopeFactory scopes, DatabaseReadi
                             {
                                 var seconds = lifecycleSettings.Value.InactiveTimeoutSeconds;
                                 if (seconds > 0 && s.UpdatedAt <= DateTime.UtcNow.AddSeconds(-seconds))
-                                    await sp.GetRequiredService<ISessionService>().EndAsync(s.OwnerAccountId, s.Id, ct);
+                                    if (!await sp.GetRequiredService<IConversationPersistence>().IsLeasedAsync(s.OwnerAccountId, s.Id, ct))
+                                        await sp.GetRequiredService<ISessionService>().SuspendAsync(s.OwnerAccountId, s.Id, s.AgentSessionId, ct);
                                 continue;
                             }
-                            if (accountActive && s.UpdatedAt > DateTime.UtcNow.AddMinutes(-2)) continue;
+                            if (accountActive)
+                            {
+                                if (s.UpdatedAt <= DateTime.UtcNow.AddSeconds(-75) && !await sp.GetRequiredService<IConversationPersistence>().IsLeasedAsync(s.OwnerAccountId, s.Id, ct))
+                                {
+                                    if (s.Status == SessionStatus.Ending)
+                                        await sp.GetRequiredService<ISessionService>().FailAsync(s.OwnerAccountId, s.Id, "transport_host_restarted_while_ending", ct);
+                                    else
+                                    { s.Status = SessionStatus.Suspended; s.DisconnectedAt = s.UpdatedAt; s.AgentSessionId = null; await sessions.ReplaceAsync(s, ct); }
+                                }
+                                continue;
+                            }
                             if (s.AgentSessionId is not null) { try { await sp.GetRequiredService<IConversationalAgentGateway>().EndSessionAsync(s.AgentSessionId, ct); } catch (Exception e) { logger.LogWarning("Deleted account voice cleanup {ErrorType}", e.GetType().Name); } }
                             s.Status = SessionStatus.Failed; s.FailureCode = accountActive ? "lifecycle_timeout" : "account_deleted"; s.EndedAt = DateTime.UtcNow; await sessions.ReplaceAsync(s, ct);
                         }
@@ -110,13 +149,27 @@ public sealed class MaintenanceWorker(IServiceScopeFactory scopes, DatabaseReadi
                         {
                             if ((q.Status is QuacktionStatus.PendingApproval or QuacktionStatus.Queued or QuacktionStatus.InProgress) && await accounts.GetAsync(q.OwnerAccountId, ct) is not { IsActive: true })
                             { q.CancellationRequested = true; if (q.Status != QuacktionStatus.InProgress) q.Status = QuacktionStatus.Cancelled; await actions.ReplaceAsync(q, ct); }
+                            else if (q.Status == QuacktionStatus.PendingApproval
+                                && q.Approval is { Status: ApprovalStatus.Pending, ExpiresAt: { } expires } && expires <= DateTime.UtcNow)
+                            {
+                                q.Approval.Status = ApprovalStatus.Expired;
+                                q.Approval.ResolvedAt = DateTime.UtcNow;
+                                q.Status = QuacktionStatus.Rejected;
+                                q.FailureCode = "approval_expired";
+                                if (await actions.ReplaceAsync(q, ct))
+                                {
+                                    var events = sp.GetRequiredService<ISessionEvents>();
+                                    await events.PublishAsync(q.OwnerAccountId, q.SessionId, "ApprovalExpired", q.Approval, ct);
+                                    await events.PublishAsync(q.OwnerAccountId, q.SessionId, "QuacktionStatusChanged", q, ct);
+                                }
+                            }
                             await actions.SyncAuditAsync(q, ct);
                         }
                     }
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
-            catch (Exception e) { logger.LogWarning("Maintenance deferred {ErrorType}", e.GetType().Name); }
+            catch (Exception e) { logger.LogWarning(e, "Maintenance deferred"); }
             await Task.Delay(TimeSpan.FromSeconds(10), ct);
         }
     }
@@ -129,19 +182,10 @@ public sealed class TransportShutdownService(IServiceScopeFactory scopes, ILogge
     {
         try
         {
-            using var scope = scopes.CreateScope();
-            var repo = scope.ServiceProvider.GetRequiredService<ISessionRepo>();
-            var sessions = scope.ServiceProvider.GetRequiredService<ISessionService>();
-            while (!ct.IsCancellationRequested)
-            {
-                var batch = await repo.ListAsync(s => s.Status == SessionStatus.Active, 0, 100, ct);
-                if (batch.Count == 0) return;
-                foreach (var session in batch)
-                {
-                    ct.ThrowIfCancellationRequested();
-                    await sessions.EndAsync(session.OwnerAccountId, session.Id, ct);
-                }
-            }
+            // Device handlers suspend their own conversations; the gateway releases only local leases.
+            await using var scope = scopes.CreateAsyncScope();
+            if (scope.ServiceProvider.GetRequiredService<IConversationalAgentGateway>() is IAsyncDisposable gateway)
+                await gateway.DisposeAsync();
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception e) { logger.LogWarning("Transport shutdown deferred to restart recovery {ErrorType}", e.GetType().Name); }

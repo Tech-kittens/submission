@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quacktion session tester</title>
+  <style>
+    body { max-width: 760px; margin: 2rem auto; padding: 0 1rem; font: 16px/1.45 system-ui, sans-serif; }
+    fieldset { margin: 1rem 0; padding: 1rem; }
+    label { display: inline-grid; gap: .25rem; margin: .35rem .6rem .35rem 0; }
+    input { padding: .4rem; }
+    button { margin: .25rem; padding: .5rem .75rem; }
+    #log { min-height: 12rem; max-height: 28rem; overflow: auto; padding: .75rem; background: #111; color: #eee; white-space: pre-wrap; }
+    .wide { width: min(100%, 28rem); }
+  </style>
+</head>
+<body>
+  <h1>Session tester</h1>
+  <p>Basic account bearer-auth session and audio WebSocket check. The access token stays in this page’s memory.</p>
+
+  <fieldset>
+    <legend>Backend</legend>
+    <label>API base URL <input class="wide" id="apiBase" type="url"></label>
+    <p id="apiTarget"></p>
+    <p id="fileOriginHint" hidden>This page is opened as a file, so the browser gives it an opaque origin and blocks the API call. Open <a href="http://localhost:5188/session-test.html">http://localhost:5188/session-test.html</a> instead.</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Account</legend>
+    <label>Email <input id="email" type="email" autocomplete="username"></label>
+    <label>Password <input id="password" type="password" autocomplete="current-password"></label>
+    <label>Name (registration only) <input id="name" value="Session tester"></label>
+    <div><button id="register">Create account</button><button id="login">Log in</button></div>
+    <p id="authState">Not logged in</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Session</legend>
+    <label>Session name <input id="sessionName" value="Browser test"></label>
+    <div><button id="startSession" disabled>Start session</button><button id="connect" disabled>Connect WebSocket</button><button id="negotiate" disabled>Send audio.start</button><button id="startMic" disabled>Start microphone</button><button id="stopMic" disabled>Stop microphone</button><button id="end" disabled>Send session.end</button><button id="disconnect" disabled>Disconnect</button></div>
+    <p id="sessionState">No session</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Audio format (must match server Audio allowlists)</legend>
+    <p>The default device formats use PCM16 little-endian mono. Configure both input and output as <code>pcm_16000</code>, 16000 Hz, mono for the example setup.</p>
+    <div>
+      <label>Input codec <input id="inputCodec" value="pcm_16000"></label>
+      <label>Sample rate <input id="inputRate" type="number" value="16000"></label>
+      <label>Channels <input id="inputChannels" type="number" value="1"></label>
+    </div>
+    <div>
+      <label>Output codec <input id="outputCodec" value="pcm_16000"></label>
+      <label>Sample rate <input id="outputRate" type="number" value="16000"></label>
+      <label>Channels <input id="outputChannels" type="number" value="1"></label>
+    </div>
+  </fieldset>
+
+  <h2>Events</h2>
+  <pre id="log" aria-live="polite"></pre>
+  <script>
+    let accessToken = null;
+    let session = null;
+    let socket = null;
+    let audioReady = false;
+    let audioContext = null;
+    let micStream = null;
+    let micSource = null;
+    let micProcessor = null;
+    let micMute = null;
+    let playbackTime = 0;
+    let micFrameCount = 0;
+    let micBytesSent = 0;
+    let micSquares = 0;
+    let micSampleCount = 0;
+    let lastMicReport = 0;
+    const playbackSources = new Set();
+    const byId = id => document.getElementById(id);
+    const initialApiBase = location.protocol === 'file:' || !['localhost', '127.0.0.1', '[::1]'].includes(location.hostname)
+      ? 'http://localhost:5188'
+      : location.origin;
+    byId('apiBase').value = initialApiBase;
+    byId('fileOriginHint').hidden = location.protocol !== 'file:';
+    function apiUrl(path) {
+      const base = byId('apiBase').value.trim().replace(/\/+$/, '');
+      byId('apiTarget').textContent = `Requests go to ${base || '(enter a backend URL)'}`;
+      return `${base}${path}`;
+    }
+    byId('apiBase').oninput = () => apiUrl('');
+    const log = value => {
+      byId('log').textContent += `${new Date().toLocaleTimeString()} ${value}\n`;
+      byId('log').scrollTop = byId('log').scrollHeight;
+    };
+    async function api(path, body, authenticated = false) {
+      const headers = { 'Content-Type': 'application/json' };
+      if (authenticated && accessToken) headers.Authorization = `Bearer ${accessToken}`;
+      const url = apiUrl(path);
+      let response;
+      try {
+        response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+      } catch (error) {
+        throw new Error(`Could not reach ${url}. ${error.message}. Check that the local backend is running and that this page is opened from its local origin.`);
+      }
+      const text = await response.text();
+      let result;
+      try { result = text ? JSON.parse(text) : null; } catch { result = text; }
+      if (!response.ok) throw new Error(`${response.status} ${result?.title || result?.code || text || response.statusText}`);
+      return result;
+    }
+    async function login() {
+      const result = await api('/api/auth/login', { email: byId('email').value, password: byId('password').value });
+      accessToken = result.accessToken;
+      byId('authState').textContent = `Logged in; token expires ${result.expiresAt}`;
+      byId('startSession').disabled = false;
+      log('Login succeeded');
+    }
+    byId('register').onclick = async () => {
+      try {
+        await api('/api/accounts', { email: byId('email').value, password: byId('password').value, name: byId('name').value });
+        log('Account created; logging in');
+        await login();
+      } catch (error) { log(`Register: ${error.message}`); }
+    };
+    byId('login').onclick = async () => { try { await login(); } catch (error) { log(`Login: ${error.message}`); } };
+    byId('startSession').onclick = async () => {
+      try {
+        session = await api('/api/sessions/start', { requestId: crypto.randomUUID(), name: byId('sessionName').value }, true);
+        byId('sessionState').textContent = `Session ${session.sessionId} (${session.status}), connection window ${session.expiresInSeconds}s`;
+        byId('connect').disabled = false;
+        log(`Session created: ${session.sessionId}`);
+      } catch (error) { log(`Start session: ${error.message}`); }
+    };
+    byId('connect').onclick = () => {
+      if (!session || !accessToken) return;
+      const url = new URL(session.webSocketUrl);
+      url.searchParams.set('access_token', accessToken);
+      socket = new WebSocket(url, 'quacktion.audio.v1');
+      socket.binaryType = 'arraybuffer';
+      socket.onopen = () => { log('WebSocket connected'); byId('negotiate').disabled = false; byId('disconnect').disabled = false; };
+      socket.onmessage = async event => {
+        if (typeof event.data !== 'string') {
+          try { await playPcm(event.data); }
+          catch (error) { log(`Audio playback: ${error.message}`); }
+          return;
+        }
+        log(`← ${event.data}`);
+        try {
+          const control = JSON.parse(event.data);
+          if (control.type === 'audio.ready') {
+            audioReady = true;
+            byId('startMic').disabled = false;
+            byId('end').disabled = false;
+            log('Audio is ready. Start the microphone and speak.');
+          } else if (control.type === 'audio.clear') {
+            for (const source of playbackSources) { try { source.stop(); } catch {} }
+            playbackSources.clear();
+            playbackTime = audioContext?.currentTime ?? 0;
+          } else if (control.type === 'session.ended' || control.type === 'session.failed') {
+            await stopMicrophone();
+          }
+        } catch (error) { if (error instanceof SyntaxError) log('Received invalid server control JSON'); }
+      };
+      socket.onerror = () => log('WebSocket error (check browser console and server logs)');
+      socket.onclose = async event => {
+        audioReady = false;
+        await stopMicrophone();
+        log(`WebSocket closed (${event.code}: ${event.reason || 'no reason'})`);
+        byId('negotiate').disabled = true;
+        byId('startMic').disabled = true;
+        byId('end').disabled = true;
+      };
+    };
+    byId('negotiate').onclick = () => {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      const number = id => Number(byId(id).value);
+      socket.send(JSON.stringify({
+        version: 1,
+        type: 'audio.start',
+        audio: {
+          protocolVersion: 1,
+          input: { codec: byId('inputCodec').value, sampleRate: number('inputRate'), channels: number('inputChannels') },
+          output: { codec: byId('outputCodec').value, sampleRate: number('outputRate'), channels: number('outputChannels') }
+        }
+      }));
+      byId('end').disabled = false;
+      log('→ audio.start sent');
+    };
+    byId('startMic').onclick = async () => {
+      if (!audioReady || !socket || socket.readyState !== WebSocket.OPEN) return;
+      try {
+        const rate = Number(byId('inputRate').value);
+        if (!byId('inputCodec').value.toLowerCase().startsWith('pcm_'))
+          throw new Error('Microphone capture currently sends PCM only. Choose a pcm_* input codec.');
+        if (Number(byId('inputChannels').value) !== 1) throw new Error('Microphone capture currently sends mono audio; set input channels to 1.');
+        if (audioContext) { try { await audioContext.close(); } catch {} audioContext = null; }
+        audioContext = new AudioContext({ sampleRate: rate });
+        if (audioContext.sampleRate !== rate) throw new Error(`Browser opened audio at ${audioContext.sampleRate} Hz, but input is configured for ${rate} Hz.`);
+        await audioContext.resume();
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, sampleRate: rate, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+        micSource = audioContext.createMediaStreamSource(micStream);
+        micProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+        micMute = audioContext.createGain();
+        micMute.gain.value = 0;
+        micProcessor.onaudioprocess = event => {
+          if (!audioReady || socket?.readyState !== WebSocket.OPEN) return;
+          const samples = event.inputBuffer.getChannelData(0);
+          const bytes = new ArrayBuffer(samples.length * 2);
+          const view = new DataView(bytes);
+          let squares = 0;
+          for (let i = 0; i < samples.length; i++) {
+            const sample = Math.max(-1, Math.min(1, samples[i]));
+            squares += sample * sample;
+            view.setInt16(i * 2, sample < 0 ? sample * 32768 : sample * 32767, true);
+          }
+          try {
+            socket.send(bytes);
+            micFrameCount++;
+            micBytesSent += bytes.byteLength;
+            micSquares += squares;
+            micSampleCount += samples.length;
+            const now = performance.now();
+            if (!lastMicReport || now - lastMicReport >= 5000) {
+              const rms = micSampleCount ? Math.sqrt(micSquares / micSampleCount) : 0;
+              log(`Mic sent ${micFrameCount} frames / ${micBytesSent} bytes; average level ${rms.toFixed(4)} RMS`);
+              micFrameCount = micBytesSent = micSquares = micSampleCount = 0;
+              lastMicReport = now;
+            }
+          } catch (error) { log(`Microphone send failed: ${error.message}`); }
+        };
+        micSource.connect(micProcessor);
+        micProcessor.connect(micMute);
+        micMute.connect(audioContext.destination);
+        byId('startMic').disabled = true;
+        byId('stopMic').disabled = false;
+        log(`Microphone streaming PCM16 at ${rate} Hz. Speak now.`);
+      } catch (error) {
+        await stopMicrophone();
+        log(`Microphone: ${error.message}`);
+      }
+    };
+    byId('stopMic').onclick = stopMicrophone;
+    async function stopMicrophone() {
+      if (micProcessor) { micProcessor.onaudioprocess = null; micProcessor.disconnect(); micProcessor = null; }
+      if (micSource) { micSource.disconnect(); micSource = null; }
+      if (micMute) { micMute.disconnect(); micMute = null; }
+      if (micStream) { micStream.getTracks().forEach(track => track.stop()); micStream = null; }
+      if (audioContext) { const context = audioContext; audioContext = null; try { await context.close(); } catch {} }
+      byId('stopMic').disabled = true;
+      byId('startMic').disabled = !audioReady;
+    }
+    async function playPcm(data) {
+      const codec = byId('outputCodec').value.toLowerCase();
+      if (!codec.startsWith('pcm_')) throw new Error('Browser playback currently supports PCM output only.');
+      if (data.byteLength < 2) return;
+      if (!audioContext || audioContext.state === 'closed') audioContext = new AudioContext({ sampleRate: Number(byId('outputRate').value) });
+      await audioContext.resume();
+      const frames = Math.floor(data.byteLength / 2);
+      const samples = new Float32Array(frames);
+      const view = new DataView(data);
+      for (let i = 0; i < frames; i++) samples[i] = view.getInt16(i * 2, true) / 32768;
+      const buffer = audioContext.createBuffer(1, frames, Number(byId('outputRate').value));
+      buffer.copyToChannel(samples, 0);
+      const source = audioContext.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioContext.destination);
+      const startAt = Math.max(audioContext.currentTime, playbackTime);
+      source.start(startAt);
+      playbackTime = startAt + buffer.duration;
+      playbackSources.add(source);
+      source.onended = () => playbackSources.delete(source);
+    }
+    byId('end').onclick = () => {
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ version: 1, type: 'session.end', requestId: crypto.randomUUID() }));
+        log('→ session.end sent');
+      }
+    };
+    byId('disconnect').onclick = () => socket?.close(1000, 'tester_disconnect');
+  </script>
+</body>
+</html>

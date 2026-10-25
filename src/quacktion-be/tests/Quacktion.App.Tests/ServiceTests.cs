@@ -66,10 +66,92 @@ public sealed class ServiceTests
         await Assert.ThrowsAsync<AppException>(() => f.SessionService.GetAsync("other", s.Id, default));
         await Assert.ThrowsAsync<AppException>(() => f.SessionService.StartAsync(a.Id, s.Id, default));
         Assert.Equal(SessionStatus.Completed, (await f.SessionService.EndAsync(a.Id, s.Id, default)).Status);
-        await Assert.ThrowsAsync<AppException>(() => f.SessionService.EndAsync(a.Id, s.Id, default));
+        Assert.Equal(SessionStatus.Completed, (await f.SessionService.EndAsync(a.Id, s.Id, default)).Status);
         var failed = await f.SessionService.CreateAsync(a.Id, new("Failure", null), default); f.Voice.Fail = true;
         await Assert.ThrowsAsync<AppException>(() => f.SessionService.StartAsync(a.Id, failed.Id, default));
         Assert.Equal(SessionStatus.Failed, (await f.Sessions.GetAsync(failed.Id, default))!.Status);
+    }
+    [Fact]
+    public async Task EndingUnconnectedAudioSessionReleasesDevice()
+    {
+        var f = new Fixture();
+        var account = await f.AccountService.RegisterAsync(new("audio@example.test", "secure-password-123", "Audio"), default);
+        var device = new Device { OwnerAccountId = account.Id, CredentialHash = "credential" };
+        await f.Devices.InsertAsync(device, default);
+
+        var started = await f.SessionService.CreateAudioSessionAsync(account.Id, device.Id, "audio-start", "Unconnected", 60, default);
+        Assert.Equal(started.Session.Id, (await f.Devices.GetAsync(device.Id, default))!.ActiveSessionId);
+
+        var ended = await f.SessionService.EndAsync(account.Id, started.Session.Id, default);
+
+        Assert.Equal(SessionStatus.Completed, ended.Status);
+        Assert.Null((await f.Devices.GetAsync(device.Id, default))!.ActiveSessionId);
+    }
+
+    [Fact]
+    public async Task NewStartsRecoverExpiredAndDeletedDeviceReservationsWithoutWaitingForMaintenance()
+    {
+        var f = new Fixture();
+        var account = await f.AccountService.RegisterAsync(new("expiry@example.test", "a-secure-password", "Duck"), default);
+        var device = new Device { OwnerAccountId = account.Id, CredentialHash = "hash" };
+        await f.Devices.InsertAsync(device, default);
+        var pending = await f.SessionService.CreateAudioSessionAsync(account.Id, device.Id, "expired", "Duck", 60, default);
+        var expired = (await f.Sessions.GetAsync(pending.Session.Id, default))!;
+        expired.ConnectionCredentialExpiresAt = DateTime.UtcNow.AddSeconds(-1);
+        await f.Sessions.ReplaceAsync(expired, default);
+        var next = await f.SessionService.CreateAudioSessionAsync(account.Id, device.Id, "next", "Duck", 60, default);
+        Assert.Equal("connection_window_expired", (await f.Sessions.GetAsync(expired.Id, default))!.FailureCode);
+        Assert.Equal(next.Session.Id, (await f.Devices.GetAsync(device.Id, default))!.ActiveSessionId);
+        Assert.True(await f.Sessions.DeleteAsync(next.Session, default));
+        var recovered = await f.SessionService.StartNewAsync(account.Id, new("Duck", device.Id, null, "audio"), "wake", default);
+        Assert.Equal(SessionStatus.Active, recovered.Status);
+    }
+
+    [Fact]
+    public async Task AudioStartRetriesDoNotExtendDeadlineAndConsumedSessionsCannotBeRefreshed()
+    {
+        var f = new Fixture();
+        var first = await f.SessionService.CreateAudioSessionAsync("owner", null, "same", "Duck", 60, default);
+        var retry = await f.SessionService.CreateAudioSessionAsync("owner", null, "same", "Duck", 60, default);
+        Assert.Equal(first.Session.ConnectionCredentialExpiresAt, retry.Session.ConnectionCredentialExpiresAt);
+        await f.SessionService.ConnectAccountSessionAsync(first.Session.Id, "owner", null, default);
+        Assert.False(await f.SessionService.ExpireReadyAsync("owner", first.Session.Id, default));
+        Assert.Equal("session_start_already_consumed", (await Assert.ThrowsAsync<AppException>(() =>
+            f.SessionService.CreateAudioSessionAsync("owner", null, "same", "Duck", 60, default))).Code);
+    }
+    [Fact]
+    public async Task EndReloadsMeetingAfterProviderFlushUpdatesItsVersion()
+    {
+        var f = new Fixture();
+        var (account, session) = await f.Seed();
+        f.Voice.OnEnd = async (_, ct) =>
+        {
+            var latest = (await f.Sessions.GetAsync(session.Id, ct))!;
+            latest.UpdatedAt = DateTime.UtcNow.AddMilliseconds(1);
+            Assert.True(await f.Sessions.ReplaceAsync(latest, ct));
+        };
+
+        var ended = await f.SessionService.EndAsync(account.Id, session.Id, default);
+
+        Assert.Equal(SessionStatus.Completed, ended.Status);
+        Assert.Equal(SessionStatus.Completed, (await f.Sessions.GetAsync(session.Id, default))!.Status);
+    }
+    [Fact]
+    public async Task ExpiredApprovalCannotBeResolvedAndIsPersistedAsExpired()
+    {
+        var f = new Fixture();
+        var (account, session) = await f.Seed();
+        var proposed = await f.ActionService.ProposeAsync(account.Id, session.Id, new("external.send", "{\"to\":\"person@example.test\"}"), default);
+        proposed.Approval!.ExpiresAt = DateTime.UtcNow.AddMinutes(-1);
+        Assert.True(await f.Actions.ReplaceAsync(proposed, default));
+
+        var error = await Assert.ThrowsAsync<AppException>(() => f.Approvals.ResolveAsync(account.Id, proposed.Id, proposed.ActionDigest, true, default));
+
+        Assert.Equal("approval_expired", error.Code);
+        var current = (await f.Actions.GetAsync(proposed.Id, default))!;
+        Assert.Equal(QuacktionStatus.Rejected, current.Status);
+        Assert.Equal(ApprovalStatus.Expired, current.Approval!.Status);
+        Assert.False(QuacktionService.ValidApproval(current));
     }
     [Fact]
     public async Task WakeWordStartIsIdempotentAndSubmitsInitialPromptOnce()
@@ -87,7 +169,7 @@ public sealed class ServiceTests
     {
         var f = new Fixture(); var (_, session) = await f.Seed();
         var service = new TranscriptService(f.Transcripts, f.SessionService, f.Sessions, f.Events);
-        var entry = new TranscriptEntry { SessionId = session.Id, SpeakerIdentifier = "agent", Text = "Sprint is on track.", Source = "elevenlabs", SourceEventId = "agent_response:conversation-1:event-7" };
+        var entry = new TranscriptEntry { SessionId = session.Id, SpeakerIdentifier = "agent", Text = "Sprint is on track.", Source = "gemini", SourceEventId = "agent_response:conversation-1:event-7" };
         await service.AppendAsync(entry, default);
         await service.AppendAsync(entry, default);
         Assert.Single(await f.Transcripts.ListAsync(x => x.SessionId == session.Id, 0, 10, default));
@@ -177,6 +259,26 @@ public sealed class ServiceTests
         var execution = f.Executor.ExecuteNextAsync(default); await f.ActionService.CancelAsync(a.Id, q.Id, default); release.SetResult(); await execution;
         Assert.Equal(QuacktionStatus.Cancelled, (await f.Actions.GetAsync(q.Id, default))!.Status);
     }
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ParentWaitsForConfirmedChildOperations(bool approve)
+    {
+        var f = new Fixture(); var (a, session) = await f.Seed();
+        var parent = await f.ActionService.ProposeAsync(a.Id, session.Id, new("mcp.request", "{}"), default);
+        var child = await f.ActionService.ProposeAsync(a.Id, session.Id, new("mcp.invoke", "{}"), default);
+        await f.Approvals.ResolveAsync(a.Id, parent.Id, parent.ActionDigest, true, default);
+        f.Agent.Run = (_, _) => Task.FromResult(new Interfaces.AgentTaskResult(true, "{}", null, PendingTaskIds: [child.Id]));
+        await f.Executor.ExecuteNextAsync(default);
+        Assert.Equal(QuacktionStatus.WaitingForTools, (await f.Actions.GetAsync(parent.Id, default))!.Status);
+        Assert.False(await f.Executor.ExecuteNextAsync(default));
+        await f.Approvals.ResolveAsync(a.Id, child.Id, child.ActionDigest, approve, default);
+        f.Agent.Run = (_, _) => Task.FromResult(new Interfaces.AgentTaskResult(true, "confirmed", null));
+        await f.Executor.ExecuteNextAsync(default);
+        await f.Executor.ExecuteNextAsync(default);
+        Assert.Equal(approve ? QuacktionStatus.Completed : QuacktionStatus.Failed, (await f.Actions.GetAsync(parent.Id, default))!.Status);
+    }
+
     [Fact]
     public async Task ExpiredLeaseRecoversWithStableIdempotencyKeyAndFencesOldWorker()
     {

@@ -37,9 +37,9 @@ Content-Type: application/json
 }
 ```
 
-The backend creates the MongoDB session, connects to the configured ElevenLabs conversation, waits for provider initialization, submits the prompt once, and returns the session object with status `Active`. Use `deviceId: null` for a Flutter-only session. If an idempotency key is supplied, reuse it only when retrying the same request. Prefer a stable unique key per user action (for example, a UUID).
+The backend creates the MongoDB session, connects to the configured Gemini Live conversation, waits for provider initialization, submits the prompt once, and returns the session object with status `Active`. Use `deviceId: null` for a Flutter-only session. If an idempotency key is supplied, reuse it only when retrying the same request. Prefer a stable unique key per user action (for example, a UUID).
 
-`promptFormat` is `text` by default. `audio` is reserved for an audio-only prompt path; do not send both a transcription and audio for the same utterance. `/api/sessions/start` and `/ws/sessions/{id}/audio` both use the account access token as a Bearer token. The backend selects the account's only paired device; with multiple paired devices, it returns `device_selection_required`.
+`promptFormat` is `text` by default. `audio` is reserved for an audio-only prompt path; do not send both a transcription and audio for the same utterance. `/api/sessions/start` and `/ws/sessions/{id}/audio` both accept an account access token as a Bearer token. The Bearer path needs no paired device; hardware can use the `Device` credential option.
 
 ### Create first, then start
 
@@ -130,6 +130,6 @@ Do not blindly repeat a create/start operation with a new idempotency key after 
 
 ## Hardware-created sessions
 
-The ESP32-S3 session audio flow also uses an account access token with `Authorization: Bearer <accessToken>` for both `POST /api/sessions/start` and the returned `/ws/sessions/{id}/audio` URL. The separate legacy `/ws/devices/{deviceId}` control socket continues to use a device credential. The ElevenLabs API key must never be sent to or stored by Flutter or firmware.
+Session audio streams directly from Flutter using the account bearer token. The separate legacy `/ws/devices/{deviceId}` hardware-control socket still uses a device credential and is not needed for Flutter session audio. The Gemini Live API key must never be sent to or stored by Flutter.
 
 The hardware request and binary audio contract are documented in [SESSION.md](SESSION.md). Session persistence, device ownership, provider initialization, transcript deduplication and SignalR authorization are backend responsibilities.

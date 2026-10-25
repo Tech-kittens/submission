@@ -12,6 +12,7 @@ public class Session : Entity
     public string? InitialPrompt { get; set; }
     public string PromptFormat { get; set; } = "text";
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime? DisconnectedAt { get; set; }
     public DateTime? EndedAt { get; set; }
     public string? FailureCode { get; set; }
     [JsonIgnore] public DateTime? ConnectionCredentialExpiresAt { get; set; }

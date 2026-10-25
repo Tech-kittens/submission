@@ -1,0 +1,23 @@
+# Google MCP skills
+
+Quacktion now has an application-level skill catalog above its existing MCP gateway. The catalog was mapped against the Calendar, Gmail and Meet tool registrations in QuacktionAI revision `c7a8bfd`. At runtime, discovery and the selected user's connected account decide availability. A catalog entry alone never authorizes a tool.
+
+`GET /api/mcp/skills` returns the owner's skill catalog with availability and reasons. `GET /api/mcp/skills/{skillId}` returns one entry. `GET /api/mcp/skills/executions` returns compact execution status records without exposing email bodies. The backend exposes no direct unauthenticated skill execution route; Argon uses the executor inside an owner-scoped Quacktion task. Jev may suggest a skill, but its suggestion is advisory. Gemini Live's conversational path is unchanged.
+
+## Mapping
+
+- Calendar skills use the gateway's discovered `calendar_list_calendars`, `calendar_list_events`, `calendar_get_event`, `calendar_create_event`, `calendar_update_event`, `calendar_delete_event`, and `calendar_free_busy`. Date range and Gmail label aliases are mapped to these exact tools with server-side argument restrictions. The free-slot and conflict skills compute results from returned intervals/events.
+- Gmail skills use `gmail_search_messages`, `gmail_get_message`, `gmail_get_thread`, `gmail_list_labels`, `gmail_create_draft`, `gmail_send_message`, `gmail_modify_labels`, and `gmail_trash_message`. A complete `gmail.send_email` request executes without a review prompt; its selected connection and content are audited. Replies remain unavailable because the gateway chooses their recipients inside the send operation, so the requested recipient cannot be checked beforehand.
+- Meet skills use `meet_create_space`, `meet_get_space`, `meet_update_space_access`, `meet_end_active_conference`, `meet_list_conference_records`, `meet_get_conference_record`, `meet_list_participants`, `meet_list_recordings`, `meet_list_transcripts`, and `meet_get_transcript_entries`. Calendar creates scheduled Meet links. No Meet participant removal or space deletion tool is exposed.
+
+Every supported operation is checked against the selected account's enabled services and discovered enabled tools. A voice request with exactly one eligible connected account is bound and queued automatically. When several accounts qualify, the owner selects one through the authenticated app; selecting it queues the request without a second general approval. Reviewed non-destructive skills execute without review even when MCP read-only annotations are missing. Destructive skills and unclassified raw tools retain exact-operation approval. A single occurrence deletion requires an occurrence ID; deleting a series requires an explicit series scope. External writes have durable audit markers and are never automatically retried after an uncertain outcome.
+
+Composite skills run their declared steps in order with fully resolved arguments. They pause at each protected step and resume after its exact child Quacktion is approved and completed. The plan is encrypted in `mcp_skill_executions` using the existing MCP encryption key. The worker reconciles a proposed child after a crash and does not repeat an approved write. Failures record which step failed and distinguish partial completion. Arguments for later steps must be resolved before starting the workflow; outputs are not silently substituted into a later step.
+
+## Availability limits
+
+The gateway revision inspected does not annotate its tools with MCP `readOnlyHint`. The reviewed application skill catalog now determines which known operations can run without review. An unclassified tool still follows the conservative low-level MCP policy. Direct voice results from an automatically bound account may be announced when idle unless the request explicitly uses `PRIVATE_NOTIFICATION` or `APPROVAL_REQUIRED`.
+
+Calendar recurrence creation/update, reminders, invitation responses, atomic attendee changes, and bulk deletion lack safe underlying operations. Gmail draft update, forwarding, label/filter creation, permanent deletion, and bulk deletion are unavailable. Meet participant removal and space deletion are unavailable. `workflow.email_meeting_summary`, `workflow.prepare_for_meeting`, `workflow.organise_meeting`, and `workflow.follow_up_after_meeting` are listed as unavailable because their required meeting-analysis or contact-resolution stages are not wired end to end.
+
+MongoDB adds `mcp_skill_executions` with indexes by owner/time and parent task/skill. Existing Quacktion tasks and `mcp_execution_audit` remain the authoritative approval and tool execution records. No new NuGet packages or environment variables are required.

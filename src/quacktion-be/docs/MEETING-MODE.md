@@ -1,0 +1,20 @@
+# Meeting Mode backend
+
+Start with `POST /api/meetings/start` and `{ "name": "...", "type": "General", "recordingConsent": true }` for a standalone phone recording. Supply `deviceId` to record through paired hardware. The existing device-specific start route also works. The owner must give participants appropriate recording notice and obtain consent. `POST /api/meetings/{id}/end` is idempotent and returns promptly while final processing runs.
+
+The existing ESP32 WebSocket sends one PCM stream. The backend tees active meeting audio to Gemini Live and records each accepted device segment as a 16 kHz mono PCM file. The segment hash in MongoDB is checked when the background worker assembles a WAV after a 35-second in-flight segment grace period. The worker does not need the provisional Gemini 3.8 Flash transcription to succeed before processing the recording.
+
+For a standalone phone meeting, send signed 16-bit little-endian 16 kHz mono PCM in 40 ms frame multiples to `POST /api/meetings/{id}/audio/segments?startMs=<offset>` with bearer authorization and `Content-Type: application/octet-stream`. Each upload is limited to 30 seconds. The offset identifies an upload for safe retries and orders chunks in the final WAV. Upload the last chunk before ending the meeting.
+
+Final file transcription uses the Gemini 3.5 Transcribe Files and Interactions APIs, with verbatim speaker diarization and word timestamps. Files are split into at most 20-minute chunks before upload. Provider speaker labels are stored as anonymous, chunk-scoped identifiers; they are not biometric recognition or authentication. Gemini Files uploads are deleted after transcription where the provider permits it. Final transcript turns are persisted to `meeting_transcript_turns`; `GET /api/meetings/{id}/transcript` returns them when ready and provisional segments before then. The final Argon report uses the final turns as evidence. Incremental analysis still uses bounded provisional segments.
+
+`GET /api/meetings/{id}/audio` downloads the final WAV for the authenticated owner. `GET /api/meetings/{id}/status` exposes processing and recording state. The other owner-protected routes include `/speakers`, `/insights`, `/analysis`, `/scorecard`, `/action-items`, and `/decisions`. `PATCH /api/meetings/{id}/speakers/{speakerId}` corrects a final speaker label for this meeting only. `DELETE /api/meetings/{id}` removes a completed or failed meeting, its MongoDB records, and its stored audio.
+
+Set `MeetingAudio__RootPath` to a **durable, private mounted volume** in production. The default `/tmp/quacktion-meetings` is for local development; Railway ephemeral storage will lose recordings on redeploy. All app instances processing a meeting must see the same volume, or deploy a single instance. Recording files and directories use owner-only Unix permissions. `MeetingAnalysis:RetentionDays` defaults to 30 and deletes completed recordings and reports automatically; zero disables retention cleanup. Existing `Gemini:ApiKey` is required. `MeetingAnalysis:WindowIntervalSeconds` controls incremental analysis (30–3600 seconds). No new NuGet packages are needed. MongoDB adds `meeting_transcript_turns`, `meeting_analyses`, and `meeting_insights`, plus new recording and processing fields on meetings and transcript fields on meeting segments.
+
+## Limits
+
+- Gemini 3.5 speaker diarization labels are local to each file chunk. The backend does not claim a stable person identity across chunks or identify the device owner by voice. Voice enrolment remains unavailable.
+- The device protocol captures speech segments, not a continuous raw recording of silence or all ambient sound. Cross-boot ordering without trustworthy device timestamps remains approximate.
+- Gemini 3.5 and Argon outputs require live provider access. Mock tests cover file assembly, provider response parsing, backend behavior and security, but do not validate acoustic accuracy or physical ESP32 latency.
+- Audio is stored on disk, not in MongoDB. Disk failure or missing chunks surface as recording errors; the service does not claim an intact recording in that case.

@@ -12,4 +12,8 @@ public class Device : Entity
     public DateTime? LastSeenAt { get; set; }
     [JsonIgnore] public string? CredentialHash { get; set; }
     [JsonIgnore] public string? ActiveSessionId { get; set; }
+    public string Mode { get; set; } = "assistant";
+    public string? RequestedMode { get; set; }
+    public bool MutedByUser { get; set; }
+    public string? MeetingId { get; set; }
 }

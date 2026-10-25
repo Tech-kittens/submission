@@ -9,7 +9,7 @@ This document describes the authentication implemented in this repository. Quack
 | Account access token | Frontend/API clients | `Authorization: Bearer <accessToken>` | 10 minutes, with 15 seconds of validation clock skew |
 | Account refresh token | Frontend/API clients | JSON body of `/api/auth/refresh` or `/api/auth/logout` | Family expires 30 days after login; each token is single-use for refresh |
 | Pairing challenge | Authenticated device owner | JSON body of `/api/devices/{id}/pair` | Five minutes; consumed once |
-| Device credential | ESP32-S3 | `Authorization: Device <credential>` during WebSocket upgrade | Until revoked; no automatic expiry |
+| Device credential | ESP32-S3 | `Authorization: Device <credential>` for device or optional session audio WebSocket connections | Until revoked; no automatic expiry |
 | External provider API key | Backend only | Provider-specific server-side authentication | Managed outside this account/device system |
 
 An account JWT cannot replace a device credential. A device credential cannot authorize account APIs. All non-local traffic must use HTTPS/WSS.
@@ -173,6 +173,8 @@ Sec-WebSocket-Protocol: quacktion.v1
 A WebSocket client supplies the remaining standard handshake headers. The `Device ` scheme is case-sensitive in the current middleware. Credentials are accepted from this header only, not query strings. The backend validates the credential and active owner before upgrading, rechecks on acceptance and every five seconds during the connection, and requires the versioned subprotocol. Session association separately verifies that the session belongs to the same account and is assigned to that device.
 
 `POST /api/devices/{id}/unpair` revokes the credential and disconnects the device. End an associated active session first; otherwise unpair returns `409 device_has_active_session`. Device credentials have no automatic expiry; rotate through unpair/pair. See [device-protocol.md](docs/device-protocol.md) for framing, connection replacement and audio negotiation.
+
+For session audio, account access tokens can authenticate with `Authorization: Bearer <accessToken>`. A paired device can instead use `Authorization: Device <credential>` for both `POST /api/sessions/start` and `/ws/sessions/{sessionId}/audio`; the credential identifies the device, so no device ID is sent.
 
 ## SignalR authentication
 

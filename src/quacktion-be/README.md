@@ -2,7 +2,9 @@
 
 A .NET 10 LTS, controller-based backend foundation for an autonomous meeting assistant. MongoDB is authoritative for identity, ownership, sessions, approvals, and durable task execution.
 
-The backend supports ElevenLabs conversational sessions and a versioned wake-word device start message. Live use requires valid ElevenLabs settings and a firmware audio format that matches the provider's negotiated format. No active session is reported until the provider WebSocket has initialized.
+Duck integration: [backend handoff status](docs/DUCK-BACKEND.md), [assistant audio](docs/SESSION.md), and [device meeting segments](docs/transcription-protocol.md).
+
+The backend uses Gemini 3.8 Live for real-time meetings, Jev for optional typed task routing, Gemini 4 Argon for complex reasoning, and Gemini 3.8 Flash for concise background work. The device continues to use mono PCM16 at 16 kHz; the backend resamples Gemini’s 24 kHz output. A session becomes active only after Gemini acknowledges setup. See the [voice migration guide](docs/GEMINI.md) and [multi-agent/MCP guide](docs/MULTI-AGENT-MCP.md).
 
 ## Implemented
 
@@ -12,7 +14,7 @@ The backend supports ElevenLabs conversational sessions and a versioned wake-wor
 - Owner-scoped device/session/task APIs; one-time pairing challenges; hashed device credentials; authenticated native WebSockets.
 - Versioned control/audio boundary, bounded bidirectional streaming, format allowlists, fragmentation limits, cancellation, reconnect replacement, credential revalidation.
 - Session transitions and cleanup, startup recovery, exclusive device reservations, incremental transcript persistence.
-- ElevenLabs signed-URL/private and direct/public WebSocket connections, session-bound conversation IDs, initial text prompts, audio transport, transcript events, provider ping/pong, and disconnect failure handling.
+- Gemini Live server-to-server WebSockets, typed setup, bounded audio streaming, transcription, interruptions, automatic reconnection with persisted resumption handles, and context recovery.
 - Authenticated `session.start` wake-word protocol with request idempotency. The wake phrase is detected locally and excluded from the initial prompt.
 - Deterministic action allowlist, immutable action parameters, digest-bound approval, leased durable work, attempts/history, retries/backoff, cancellation and idempotency contracts.
 - Account-authorized, session-scoped SignalR groups, including events after meeting completion.
@@ -40,6 +42,8 @@ Use HTTPS/WSS for any non-local deployment. The application requires a signing k
 
 See [AUTH.md](AUTH.md) for authentication endpoints, token rotation, revocation behavior, device credentials, and SignalR authentication.
 
+Open `/session-test.html` on the running site for a minimal browser session tester. It can create an account or log in, start an account-owned session, connect the audio WebSocket, negotiate formats, capture microphone PCM, and play returned PCM audio. After `audio.ready`, choose **Start microphone** and speak; browser microphone permission is required. Set the input and output formats to values present in the server's `Audio__AllowedInputFormats__*` and `Audio__AllowedOutputFormats__*` settings. The browser tester currently handles PCM formats only. The browser WebSocket API cannot set an Authorization header, so this endpoint accepts the account JWT as the `access_token` query parameter specifically on `/ws/sessions`; use HTTPS in deployment and avoid sharing copied WebSocket URLs.
+
 ## Configuration
 
 Use environment variables, `dotnet user-secrets` after initializing the Web project, or a deployment secret provider. No real credentials are included.
@@ -52,17 +56,19 @@ Use environment variables, `dotnet user-secrets` after initializing the Web proj
 | `MongoDB__Database` | Defaults to `quacktion` |
 | `Cors__Origins__0`, etc. | Exact frontend origins in Development; deployed environments allow all origins |
 | `AllowedHosts` | Set to deployed hostnames; defaults to local hosts |
-| `ElevenLabs__AgentId` | Required configured agent ID |
-| `ElevenLabs__ApiKey` | Required for private agents when `ElevenLabs__UseSignedUrl=true` (default); keep it server-side |
-| `ElevenLabs__UseSignedUrl` | `true` for private agents; set `false` for public agents |
+| `Gemini__LiveModel` | Default `gemini-3.8-live` |
+| `Gemini__ApiKey` | Google AI Studio API key; server-side only; required in Production |
+| `Gemini__ReasoningModel`, `Gemini__FastReasoningModel`, `Gemini__Voice` | Defaults `gemini-4-argon`, `gemini-3.8-flash`, `Puck` |
+| `Gemini__SystemInstruction` | Optional override of the meeting persona in `GeminiSettings` |
+| `Gemini__EnableInputTranscription`, `Gemini__EnableOutputTranscription`, `Gemini__EnableSessionResumption`, `Gemini__EnableContextCompression` | All default `true` |
 | `Sessions__InactiveTimeoutSeconds` | End idle sessions after this many seconds; `0` disables the timeout; default `1800` |
 | `SessionAudio__ConnectionWindowSeconds` | Time allowed to open the session audio WebSocket after session creation; default `60`, capped at 300 seconds |
 | `Audio__AllowedInputFormats__0__Codec`, `SampleRate`, `Channels` | Explicit device input allowlist |
 | `Audio__AllowedOutputFormats__0__Codec`, `SampleRate`, `Channels` | Explicit output allowlist |
 
-Both audio format lists default to empty. Configure exact device formats only after confirming the codec/rate/channels match ElevenLabs metadata; no transcoding is performed. The API key and signed URL are never returned to clients.
+Input defaults to mono PCM16 little-endian at 16 kHz. Output allows mono PCM16 at 16 kHz (backend resampled) or 24 kHz (native Gemini). No API key or resumption handle is returned to clients.
 
-This version supports **one Web/transport process per deployment**. Its connection registry and live voice resources are process-local. Durable task leases support competing workers, but do not run multiple Web instances: startup recovery assumes it owns the transport. Multi-host WebSocket ownership, routing, SignalR backplanes, and coordinated session recovery are future work. Behind a proxy, configure trusted forwarded headers explicitly before enabling redirects/rate limits; the application does not trust arbitrary forwarding headers.
+This version supports **one Web/transport process per deployment**. Its connection registry and live voice resources are process-local. Durable task leases support competing workers, but do not run multiple Web instances: startup recovery assumes it owns the transport. Multi-host WebSocket ownership, routing, SignalR backplanes, and coordinated session recovery are future work. The app trusts one `X-Forwarded-Proto` hop to detect Railway's public HTTPS scheme; Railway overwrites that header on public ingress. Keep direct/private access to the app within the same trust boundary. Forwarded client-IP and host headers are not consumed.
 
 ## API
 
@@ -74,12 +80,26 @@ Except account creation and `/api/auth/*`, APIs require `Authorization: Bearer <
 | Authentication | `POST /api/auth/login`, `/refresh`, `/logout` |
 | Devices | `POST`, `GET /api/devices`; `GET`, `PATCH`, `DELETE /api/devices/{id}` |
 | Pairing/status | `POST /api/devices/{id}/pairing-challenges`, `/pair`, `/unpair`; `GET /api/devices/{id}/status` |
+| Meetings | `POST`, `GET /api/meetings`; `GET`, `DELETE /api/meetings/{id}`; `POST /api/meetings/{id}/end` (Bearer token; device ID optional on creation) |
 | Sessions | `POST`, `GET /api/sessions`; `GET`, `PATCH`, `DELETE /api/sessions/{id}`; `POST .../start`, `.../end` |
 | Session data | `GET /api/sessions/{id}/transcript`, `.../quacktions`; `POST .../quacktions` to propose a task |
 | Quacktions | `GET /api/quacktions`, `/{id}`; `POST /{id}/approve`, `/reject`, `/cancel`, `/retry` |
 | Agent catalog | `GET /api/agents` (enabled server-configured providers) |
+| MCP connections | `GET /api/mcp/providers`, `/api/mcp/connections`; connect, OAuth callback, disconnect, and tool-selection routes in [the MCP guide](docs/MULTI-AGENT-MCP.md) |
 | Notifications | SignalR `/hubs/sessions`; `JoinSession(sessionId)`, `LeaveSession(sessionId)` |
 | Hardware | Native WebSocket `/ws/devices/{deviceId}` |
+
+Create a meeting from an app without a duck:
+
+```http
+POST /api/meetings
+Authorization: Bearer <access-token>
+Content-Type: application/json
+
+{"name":"Planning","recordingConsent":true}
+```
+
+The Bearer token identifies the owner. No `deviceId` is required for phone recording. To record through a paired duck, optionally add its `deviceId` to this body; ownership is checked. `/api/meetings/start` remains an alias. Swagger's **Authorize** button accepts an access token and sends the Bearer header for protected endpoints. A device ID alone never authenticates a request.
 
 Registration: `{ "email", "password", "name" }`; email is the login identifier and passwords are 12–128 characters. Login: `{ "email", "password" }`. The profile name is editable independently. Refresh/logout: `{ "refreshToken" }`. Store refresh tokens securely in the frontend, never in URLs. Refresh rotation is intentionally strict: serialize refresh requests; concurrent use revokes the family. Logout revokes that refresh family; existing access tokens expire within 10 minutes. Password change and account deletion invalidate access tokens through the database security stamp check.
 
@@ -108,13 +128,13 @@ SignalR events: `SessionStatusChanged`, `TranscriptReceived`, `QuacktionProposed
 
 ## Incomplete integrations
 
-- **ElevenLabs:** the live server-to-server WebSocket and event/audio bridge are implemented against the documented [WebSocket contract](https://elevenlabs.io/docs/eleven-agents/libraries/web-sockets). Configure an agent and credentials before starting. Firmware codec selection and physical playback still need validation. The backend intentionally does not transcode.
+- **Gemini:** automated tests use scripted provider sockets. Live verification requires a valid Google AI Studio key and model access. Physical microphone/speaker validation remains a deployment check.
 - **quack.ofneill.com:** protocol and responsibilities remain undecided. `QuacktionAgentGateway` reports `quack_protocol_not_configured`; no remote endpoints are invented or called.
-- **Task agents:** register an `IAgentGateway` with explicit capabilities and provision an enabled `agents` document with a matching `Provider` and capabilities. Metadata alone cannot make a provider executable. Gateway requests include owner, session, exact action parameters, and stable idempotency key. There is deliberately no public endpoint to register arbitrary URLs or change capabilities.
-- **Research/verification:** contracts model sources, retrieval times, evidence, and assessment. Unconfigured research fails explicitly; claim verification returns `NotVerified`, not invented evidence. No pre-meeting research or proactive suggestion provider has been installed.
-- **Hardware:** binary/control framing is tested against a fake adapter, not physical firmware. No production audio format is enabled and no transcoding is implemented. Add `Audio__AllowedInputFormats__0__...` and output settings only after matching them to the provider’s conversation-init metadata and firmware output.
+- **Task agents:** Gemini is the built-in fallback for `internal.summary`, `internal.analysis`, `internal.suggestions`, `internal.research`, and approval-gated `meeting.announce`. Explicit enabled agent catalog entries take precedence. Other capabilities require a real `IAgentGateway`; metadata cannot make them executable.
+- **Research/verification:** Gemini task research uses Google Search grounding and persists the evidence metadata. The standalone research/claim-verification service remains unconfigured and does not fabricate results. There is no CRM, ticket, email or internal-search connector.
+- **Hardware:** existing `QuacktionHW/firmware/main/session_audio.c` negotiates 16 kHz input/output and handles `audio.clear`. No firmware audio-format change is required. Validate physical playback, barge-in and echo cancellation on the device before rollout.
 
-For local private-agent development, keep the API key out of source control with `dotnet user-secrets` from `src/Quacktion.Web` (`dotnet user-secrets set "ElevenLabs:ApiKey" "..."`; set `ElevenLabs:AgentId` the same way). Deployment environments can use `ElevenLabs__ApiKey`, `ElevenLabs__AgentId`, and `ElevenLabs__UseSignedUrl`. Public agents can use `UseSignedUrl=false` and do not require an API key.
+Store the local API key with `dotnet user-secrets set --project src/Quacktion.Web "Gemini:ApiKey" "<key>"`. In Railway use `Gemini__ApiKey`. Development without a key starts the HTTP API but rejects live sessions; Production validates the key is present at startup.
 
 ## Tests
 
@@ -124,22 +144,26 @@ dotnet test Quacktion.sln
 QUACKTION_TEST_MONGO=mongodb://localhost:27017 dotnet test Quacktion.sln
 ```
 
-No live ElevenLabs credentials are needed for tests. The WebSocket wake-word test logs in, pairs a fake device, sends `session.start` with the prompt text (without “Quacktion”), retries the same request ID, and checks the created Active session and one prompt submission. It uses in-memory repositories and a fake ElevenLabs gateway; it does not validate a live MongoDB or provider response. The application tests cover account/authentication, token replay, pairing, owner checks, session transitions/device association, startup idempotency, deterministic risk, approvals/rejections, safe execution, retries, cancellation, duplicate worker claims, lease recovery, and tasks surviving session end. Web tests exercise controller discovery/DI, JWT revocation, ProblemDetails, SignalR authorization, device authentication, bidirectional audio using an explicit test-only format, reconnect and message limits. A full-host test runs actual startup/index initialization and the MongoDB-backed BackgroundService with a test-only task gateway, and checks fail-closed voice startup. Mongo tests cover actual driver serialization, unique indexes, optimistic concurrency, concurrent leases, fencing, audit projection and refresh-token reuse.
+Ordinary tests require no Google credentials. The suite covers authentication, ownership, approvals, leases, session APIs, the device protocol, Gemini setup, PCM encoding/decoding, resampling, interruption, tool correlation/idempotency, transcripts, reconnection and cancellation. MongoDB tests use isolated databases. The real provider smoke test is opt-in: set `QUACKTION_TEST_GEMINI_KEY` and run `dotnet test --filter Category=LiveGemini`.
 
-To exercise the wake-word control protocol without hardware, run `dotnet test tests/Quacktion.Web.Tests --filter AuthenticatedWakeWordMessageCreatesOneSessionAndSendsInitialPromptOnce`. For session-based audio proxying, provision and pair a device as described in [the device protocol](docs/device-protocol.md), configure the server-side ElevenLabs settings and exact audio allowlists, then run the WAV simulator:
+To exercise the wake-word control protocol without hardware, run `dotnet test tests/Quacktion.Web.Tests --filter AuthenticatedWakeWordMessageCreatesOneSessionAndSendsInitialPromptOnce`. For session audio, configure the Gemini key and run the WAV simulator:
 
 ```bash
 dotnet run --project tools/Quacktion.AudioSimulator -- http://localhost:5188 <access-token> input.wav output.wav [input-codec] [output-codec] [output-rate] [output-channels]
 ```
 
-The simulator calls `POST /api/sessions/start` with `Authorization: Bearer <accessToken>`, opens the returned URL with the same bearer token, negotiates `audio.start`, streams PCM 16-bit WAV data as binary frames and writes received PCM frames to `output.wav`. The backend selects the account's only paired device; if there are multiple paired devices, the request returns `device_selection_required`. The input WAV sample rate, channel count and codec must match the configured device input allowlist and ElevenLabs conversation metadata; pass the optional output codec/rate/channel arguments when provider output differs. No resampling or transcoding is performed. The WAV tool supports PCM 16-bit input and output only. Configure `Audio__AllowedInputFormats__0__Codec`, `SampleRate`, `Channels` and the corresponding output settings to match the actual hardware/provider formats. Never put account access tokens or ElevenLabs API keys in firmware logs.
+The simulator calls `POST /api/sessions/start` with the owning account bearer token, connects to `/ws/sessions/{id}/audio`, negotiates audio, sends 30 ms binary PCM frames and saves returned PCM to WAV. Use mono PCM16 input at 16 kHz. Output defaults to 16 kHz; optionally request `pcm_24000 24000 1` for native output. Hardware uses its paired device credential. The backend performs 24→16 kHz resampling when needed.
 
-For live ElevenLabs verification, set `ElevenLabs__AgentId` and (for a private agent) `ElevenLabs__ApiKey` server-side, then run the simulator with a short PCM16 WAV whose exact format is allowlisted. Confirm the session reaches `Active`, provider audio appears in `output.wav`, transcripts show up via `GET /api/sessions/{id}/transcript` and SignalR, and the simulator receives `session.ended`. Do not use the ElevenLabs text-to-speech-only WebSocket endpoint; this integration uses the Conversational AI conversation WebSocket and its `user_audio_chunk`/`audio` events.
+For live verification, run the simulator with a short spoken request addressing Quacktion. Confirm the session reaches `Active`, `output.wav` contains a correctly paced reply, transcripts appear in REST and SignalR, interruption clears queued playback, and session ending releases the device. See [deployment and smoke-test instructions](docs/GEMINI.md).
 
 ## Firmware next steps
 
-1. Agree codec, channel count, sample rates, byte ordering, framing/duration and buffering limits with the ESP32-S3 firmware team, then set the audio allowlists.
+1. Keep the existing 16 kHz PCM16 mono input/output negotiation. Native 24 kHz output is optional for clients that explicitly support it.
 2. Implement physical provisioning of the one-time returned device credential, secure device storage, certificate validation, heartbeat and reconnect behavior.
-3. Validate the ElevenLabs adapter against the configured provider audio formats and events; add any required resampling/transcoding explicitly.
+3. Verify `audio.clear` immediately discards unplayed audio and that acoustic echo cancellation works on the target hardware.
 4. Exercise mic → backend → provider → backend → speaker with physical hardware. Measure latency, disconnect recovery, backpressure, echo handling, interruptions, and session teardown before enabling real meetings.
 5. Add production retention, secret rotation, deployment monitoring, and multi-host coordination as deployment requirements become known.
+
+### Autonomous meeting preparation
+
+The optional [meeting preparation backend](docs/meeting-preparation/README.md) adds calendar synchronisation through the existing MCP gateway, native Argon research, Atlas hybrid meeting memory, durable duck notifications and Gemini Live briefings. It is disabled by default and requires Atlas/MCP/Gemini configuration. See the guide for verified boundaries, API examples, environment variables and tests.

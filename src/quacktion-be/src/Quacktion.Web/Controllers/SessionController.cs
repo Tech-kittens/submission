@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
 using Quacktion.App.DTOs;
@@ -8,20 +9,32 @@ namespace Quacktion.Web.Controllers;
 public sealed class SessionAudioSettings { public int ConnectionWindowSeconds { get; set; } = 60; }
 
 [Route("api/sessions")]
-public sealed class SessionController(ISessionService service, IDeviceRepo devices, ITranscriptService transcripts, IQuacktionService actions,
-    IOptions<SessionAudioSettings> audioSettings) : OwnedController
+public sealed class SessionController(ISessionService service, IDeviceAuthenticationService deviceAuthentication, ITranscriptService transcripts, IQuacktionService actions,
+    IOptions<SessionAudioSettings> audioSettings, IWebHostEnvironment environment, IConversationPersistence history) : OwnedController
 {
-    [HttpPost("start")]
+    [AllowAnonymous, HttpPost("start")]
     public async Task<IActionResult> StartAudioSession([FromBody] SessionAudioStartRequest request,
         [FromHeader(Name = "Idempotency-Key")] string? idempotencyKey, CancellationToken ct)
     {
-        var pairedDevices = await devices.ListAsync(d => d.OwnerAccountId == Owner && d.CredentialHash != null, 0, 2, ct);
-        if (pairedDevices.Count == 0) throw new AppException(409, "paired_device_required");
-        if (pairedDevices.Count > 1) throw new AppException(409, "device_selection_required");
+        var authorization = Request.Headers.Authorization.ToString();
+        string owner;
+        string? deviceId = null;
+        if (authorization.StartsWith("Device ", StringComparison.OrdinalIgnoreCase))
+        {
+            var device = await deviceAuthentication.AuthenticateCredentialAsync(authorization[7..], ct);
+            if (device is null) throw new AppException(401, "invalid_device_credentials");
+            owner = device.OwnerAccountId;
+            deviceId = device.Id;
+        }
+        else if (User.Identity?.IsAuthenticated == true)
+            owner = Owner;
+        else
+            throw new AppException(401, "invalid_session_authentication");
+
         var requestId = string.IsNullOrWhiteSpace(idempotencyKey) ? request.RequestId : idempotencyKey;
-        var started = await service.CreateAudioSessionAsync(pairedDevices[0].Id, requestId ?? "", request.Name,
+        var started = await service.CreateAudioSessionAsync(owner, deviceId, requestId ?? "", request.Name,
             audioSettings.Value.ConnectionWindowSeconds, ct);
-        var scheme = Request.IsHttps ? "wss" : "ws";
+        var scheme = Request.IsHttps || !environment.IsDevelopment() ? "wss" : "ws";
         var webSocketUrl = $"{scheme}://{Request.Host}/ws/sessions/{Uri.EscapeDataString(started.Session.Id)}/audio";
         return Ok(new
         {
@@ -39,6 +52,8 @@ public sealed class SessionController(ISessionService service, IDeviceRepo devic
             : await service.CreateAsync(Owner, request, ct);
         return CreatedAtAction(nameof(Get), new { id = s.Id }, s);
     }
+    [HttpPost("{id}/resume")] public async Task<IActionResult> Resume(string id, CancellationToken ct) => Ok(await service.SelectResumeAsync(Owner, id, ct));
+    [HttpGet("{id}/history")] public async Task<IActionResult> History(string id, CancellationToken ct, long after = 0, int limit = 50) => Ok(await history.HistoryAsync(Owner, id, after, limit, ct));
     [HttpGet] public async Task<IActionResult> List(CancellationToken ct, int offset = 0, int limit = 50) => Ok(new Page<App.Models.Session>(await service.ListAsync(Owner, offset, limit, ct), offset, limit));
     [HttpGet("{id}")] public async Task<IActionResult> Get(string id, CancellationToken ct) => Ok(await service.GetAsync(Owner, id, ct));
     [HttpPatch("{id}")] public async Task<IActionResult> Update(string id, SessionUpdate request, CancellationToken ct) => Ok(await service.UpdateAsync(Owner, id, request, ct));

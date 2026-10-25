@@ -7,5 +7,6 @@ public class ApprovalRequest : Entity
     public string OwnerAccountId { get; set; } = "";
     public string ActionDigest { get; set; } = "";
     public ApprovalStatus Status { get; set; }
+    public DateTime? ExpiresAt { get; set; }
     public DateTime? ResolvedAt { get; set; }
 }

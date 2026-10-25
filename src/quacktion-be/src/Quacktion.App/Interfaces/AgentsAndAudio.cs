@@ -9,44 +9,31 @@ public interface IConversationalAgentGateway
     Task SendUserTextAsync(string agentSessionId, string text, CancellationToken cancellationToken);
     Task EndSessionAsync(string agentSessionId, CancellationToken cancellationToken);
 }
-public record ElevenLabsEvent(
-    string Type,
-    string? EventId = null,
-    string? Text = null,
-    byte[]? Audio = null,
-    string? ConversationId = null,
-    long? PingEventId = null,
-    string? ErrorCode = null
-);
-public interface IElevenLabsConversation : IAsyncDisposable
-{
-    string ConversationId { get; }
-    Task SendUserTextAsync(string text, CancellationToken cancellationToken = default);
-    Task SendAudioAsync(ReadOnlyMemory<byte> audio, CancellationToken cancellationToken = default);
-    Task SendPongAsync(long eventId, CancellationToken cancellationToken = default);
-    IAsyncEnumerable<ElevenLabsEvent> ReceiveEventsAsync(CancellationToken cancellationToken = default);
-    Task CloseAsync(CancellationToken cancellationToken = default);
-}
-public interface IElevenLabsService
-{
-    Task<IElevenLabsConversation> ConnectAsync(string sessionId, CancellationToken cancellationToken = default);
-}
-public interface IConversationEventSink
-{
-    Task HandleAsync(string sessionId, string conversationId, ElevenLabsEvent item, CancellationToken cancellationToken);
-}
 public record AgentTaskRequest(string ActionType, string ParametersJson, string IdempotencyKey, string OwnerAccountId, string SessionId);
-public record AgentTaskResult(bool Success, string? ResultJson, string? FailureCode, bool Transient = false);
+public record AgentTaskResult(bool Success, string? ResultJson, string? FailureCode, bool Transient = false, IReadOnlyList<string>? PendingTaskIds = null);
 public interface IAgentGateway
 {
     string Provider { get; }
     bool Supports(string capability);
     Task<AgentTaskResult> ExecuteAsync(AgentTaskRequest request, CancellationToken ct);
 }
+public sealed record AgentRouteCandidate(string Provider, string[] Capabilities);
+public sealed record AgentRouteRequest(string ActionType, string ParametersJson, IReadOnlyList<AgentRouteCandidate> Candidates);
+public sealed record AgentRouteDecision(string Provider, string Intent, double Confidence);
+public interface IJevSkillRouter
+{
+    Task<string?> SuggestSkillAsync(string query, IReadOnlyList<Quacktion.App.Models.McpSkillDefinition> available,
+        CancellationToken ct);
+}
+public interface IAgentRouter
+{
+    Task<AgentRouteDecision?> RouteAsync(AgentRouteRequest request, CancellationToken ct);
+}
 public interface IAgentOrchestrator { Task<AgentTaskResult> ExecuteAsync(AgentTaskRequest request, CancellationToken ct); }
 public record AudioFormat(string Codec, int SampleRate, int Channels);
 public record AudioNegotiation(int ProtocolVersion, AudioFormat Input, AudioFormat Output);
-public record ProviderEvent(string Type, byte[]? Audio = null, TranscriptEntry? Transcript = null);
+public record ProviderEvent(string Type, byte[]? Audio = null, TranscriptEntry? Transcript = null,
+    CancellationToken PlaybackCancellation = default, string? TurnId = null, long ReceivedAt = 0);
 public interface IAudioProviderAdapter
 {
     Task NegotiateAsync(string agentSessionId, AudioNegotiation negotiation, CancellationToken ct);
@@ -68,6 +55,12 @@ public interface ISessionAudioConnectionManager
 public interface IAudioStreamCoordinator
 {
     Task<string> AttachAsync(Device device, string sessionId, AudioNegotiation negotiation, CancellationToken ct);
+    Task<string> AttachAsync(string owner, string sessionId, AudioNegotiation negotiation, CancellationToken ct);
     Task SendAsync(string agentSessionId, ReadOnlyMemory<byte> frame, CancellationToken ct);
     IAsyncEnumerable<ProviderEvent> ReadAsync(string agentSessionId, CancellationToken ct);
+}
+
+public interface IConversationAttachmentGateway
+{
+    bool IsActive(string agentSessionId);
 }

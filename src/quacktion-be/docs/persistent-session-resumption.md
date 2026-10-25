@@ -1,0 +1,15 @@
+# Persistent conversation sessions
+
+A `sessions` document remains the logical conversation and retains its existing ID, transcript, Quacktions, and approval references. `conversation_sessions` stores its cross-process provider lease and checkpoint sequence. `conversation_events` stores bounded, paged lifecycle and finalized transcript events. `device_transport_states` independently fences ESP32 WebSocket ownership and records meeting recording interruptions. The active meeting remains in the existing `meetings` collection.
+
+Gemini Live setup includes `sessionResumption` and the latest provider `newHandle` is stored in `realtime_states.EncryptedResumptionHandle`. AES-GCM encrypts it with owner/session associated data. Set `SessionPersistence__HandleEncryptionKey` to a stable base64 encoded 32 byte key in Railway and every backend instance. Generate one with `openssl rand -base64 32`. If unset, handles are not persisted and resumption uses context restoration. On deployment, retain the same key; rotating it intentionally invalidates saved handles and causes context restoration. Legacy plaintext `ResumptionHandle` fields are unset during Mongo initialization.
+
+The Gemini Live API session resumption protocol provides `sessionResumption.handle` in setup and `sessionResumptionUpdate` updates from the server. The implementation uses the latest handle, falls back to a new provider session when an existing handle is rejected, and restores bounded context from persisted transcripts, the attached active meeting's insights, and active or announced Quacktions. Logs distinguish `NativeResumption=true` from context restoration and never include handles.
+
+A 60 second provider lease is renewed every 10 seconds; a 30 second device transport lease is renewed every 5 seconds. Stale leases expire so another Railway instance can recover the session. Sessions already suspended are automatically resumed when the authenticated device reconnects. Account audio WebSocket connections can reconnect to a suspended session. Explicitly completed sessions are not automatically resumed; `POST /api/sessions/{id}/resume` selects a prior session for explicit resumption, and the owner then reconnects over its authenticated transport.
+
+`GET /api/sessions/{id}/history?after=0&limit=50` pages the event journal. Sequence numbers may contain gaps if a process stops between sequence allocation and event insertion. The existing transcript endpoint remains the source for complete transcript retrieval.
+
+During a recording interruption the meeting stays active. A deliberate transport close records its interruption start; an abrupt same-process replacement or expired-device-lease recovery marks the start as estimated from the previous checkpoint. The first resumed audio closes the gap. A meeting is never represented as fully recorded during that interval.
+
+These behaviors are backend verified with mocks and local Mongo integration tests when MongoDB is available. Provider level handle validity, Railway multi-instance behavior, key provisioning, and ESP32 firmware behavior require deployment verification; no real Gemini session was resumed in this test run.

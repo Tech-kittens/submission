@@ -28,6 +28,10 @@ public class ApiFactory : WebApplicationFactory<Program>
         builder.ConfigureServices(s =>
         {
             s.RemoveAll<IHostedService>();
+            s.RemoveAll<IConversationPersistence>();
+            s.RemoveAll<IDeviceTransportPersistence>();
+            s.RemoveAll<IConversationContextService>();
+            s.AddSingleton<IConversationPersistence, TestConversationPersistence>();
             s.AddSingleton(new DatabaseReadiness { Ready = true });
             s.AddSingleton<IAccountRepo, Accounts>(); s.AddSingleton<IRefreshTokenRepo, Tokens>();
             s.AddSingleton<IDeviceRepo, Devices>(); s.AddSingleton<IPairingChallengeRepo, Challenges>(); s.AddSingleton<ISessionRepo, Sessions>();
@@ -64,12 +68,6 @@ public sealed class ApiTests
     {
         await using var f = new SessionAudioApiFactory();
         var (client, account, token) = await f.Login("session-audio");
-        var created = await client.PostAsJsonAsync("/api/devices", new DeviceRequest("esp-session-audio", "ESP"));
-        var device = await created.Content.ReadFromJsonAsync<JsonElement>();
-        var deviceId = device.GetProperty("device").GetProperty("id").GetString()!;
-        var pairing = device.GetProperty("pairing");
-        using var paired = await client.PostAsJsonAsync($"/api/devices/{deviceId}/pair", new PairRequest(pairing.GetProperty("challengeId").GetString()!, pairing.GetProperty("challenge").GetString()!));
-        paired.EnsureSuccessStatusCode();
         using var startRequest = new HttpRequestMessage(HttpMethod.Post, "/api/sessions/start")
         {
             Content = JsonContent.Create(new { name = "Audio test" })
@@ -80,7 +78,9 @@ public sealed class ApiTests
         var started = await startResponse.Content.ReadFromJsonAsync<JsonElement>();
         var sessionId = started.GetProperty("sessionId").GetString()!;
         Assert.Equal("Ready", started.GetProperty("status").GetString());
-        Assert.Contains($"/ws/sessions/{sessionId}/audio", started.GetProperty("webSocketUrl").GetString());
+        var webSocketUrl = new Uri(started.GetProperty("webSocketUrl").GetString()!);
+        Assert.Equal("ws", webSocketUrl.Scheme);
+        Assert.Contains($"/ws/sessions/{sessionId}/audio", webSocketUrl.AbsoluteUri);
         using var retryRequest = new HttpRequestMessage(HttpMethod.Post, "/api/sessions/start")
         {
             Content = JsonContent.Create(new { name = "Audio test" })
@@ -120,10 +120,10 @@ public sealed class ApiTests
         var ended = await ws.ReceiveAsync(buffer, timeout.Token);
         var endedJson = JsonDocument.Parse(buffer.AsMemory(0, ended.Count)).RootElement;
         Assert.Equal("session.ended", endedJson.GetProperty("type").GetString());
-        using var scope = f.Services.CreateScope();
+        await using var scope = f.Services.CreateAsyncScope();
         var persisted = await scope.ServiceProvider.GetRequiredService<ISessionRepo>().GetAsync(sessionId, timeout.Token);
         Assert.Equal(account.Id, persisted!.OwnerAccountId);
-        Assert.Equal(deviceId, persisted.DeviceId);
+        Assert.Null(persisted.DeviceId);
         Assert.Equal(SessionStatus.Completed, persisted.Status);
     }
 
@@ -135,7 +135,16 @@ public sealed class ApiTests
         var (client, _, _) = await f.Login(); Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/accounts/me")).StatusCode);
         var swagger = await client.GetStringAsync("/swagger/v1/swagger.json");
         foreach (var route in new[] { "/api/accounts/me", "/api/auth/refresh", "/api/devices/{id}/pair", "/api/sessions/{id}/start", "/api/quacktions/{id}/approve", "/api/agents" }) Assert.Contains(route, swagger);
-        using var scope = f.Services.CreateScope();
+        using var document = System.Text.Json.JsonDocument.Parse(swagger);
+        var root = document.RootElement;
+        Assert.Equal("bearer", root.GetProperty("components").GetProperty("securitySchemes").GetProperty("Bearer").GetProperty("scheme").GetString());
+        foreach (var (path, method) in new[] { ("/api/meetings", "get"), ("/api/meetings", "post"),
+            ("/api/meetings/{id}", "get"), ("/api/meetings/start", "post"), ("/api/sessions/start", "post"),
+            ("/api/devices/{deviceId}/meetings", "post"), ("/api/notifications", "get") })
+            Assert.True(root.GetProperty("paths").GetProperty(path).GetProperty(method).GetProperty("security")[0].TryGetProperty("Bearer", out _));
+        Assert.False(root.GetProperty("paths").GetProperty("/api/auth/login").GetProperty("post").TryGetProperty("security", out var loginSecurity)
+            && loginSecurity.GetArrayLength() > 0);
+        await using var scope = f.Services.CreateAsyncScope();
         foreach (var type in new[] { typeof(IAccountService), typeof(IDeviceService), typeof(ISessionService), typeof(IQuacktionExecutionService), typeof(IApprovalService), typeof(IAudioStreamCoordinator), typeof(IAgentOrchestrator), typeof(ITranscriptService), typeof(IResearchService), typeof(IClaimVerificationService) }) Assert.NotNull(scope.ServiceProvider.GetRequiredService(type));
     }
     [Fact]
@@ -210,7 +219,7 @@ public sealed class ApiTests
         await ws.SendAsync(Encoding.UTF8.GetBytes(command), WebSocketMessageType.Text, true, timeout.Token);
         var retry = await ws.ReceiveAsync(buffer, timeout.Token); var retryResponse = JsonDocument.Parse(buffer.AsMemory(0, retry.Count)).RootElement.Clone();
         Assert.Equal(sessionId, retryResponse.GetProperty("payload").GetProperty("sessionId").GetString());
-        using var scope = f.Services.CreateScope();
+        await using var scope = f.Services.CreateAsyncScope();
         var session = await scope.ServiceProvider.GetRequiredService<ISessionRepo>().GetAsync(sessionId!, timeout.Token);
         Assert.Equal(account.Id, session!.OwnerAccountId); Assert.Equal(id, session.DeviceId); Assert.Equal(SessionStatus.Active, session.Status);
         Assert.Equal(new[] { "What is the current status of our sprint?" }, f.Services.GetRequiredService<Voice>().UserTexts);

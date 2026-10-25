@@ -11,7 +11,7 @@ namespace Quacktion.Web.Controllers;
 public sealed class AccountController(IAccountService service) : OwnedController
 {
     [HttpPost, AllowAnonymous, EnableRateLimiting("sensitive")]
-    public async Task<IActionResult> Create(RegisterRequest request, CancellationToken ct)
+    public async Task<IActionResult> Create([FromBody] RegisterRequest request, CancellationToken ct)
     {
         var account = await service.RegisterAsync(request, ct);
         return Created("/api/accounts/me", account);

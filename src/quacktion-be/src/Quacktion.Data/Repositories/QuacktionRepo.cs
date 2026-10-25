@@ -51,6 +51,28 @@ public sealed class QuacktionRepo(IMongoDbContext db) : MongoRepo<TaskAction>(db
         foreach (var execution in action.History)
             await Context.Collection<QuacktionExecution>().ReplaceOneAsync(x => x.Id == execution.Id, execution, new ReplaceOptions { IsUpsert = true }, ct);
         if (action.Approval is { } approval)
-            await Context.Collection<ApprovalRequest>().ReplaceOneAsync(x => x.Id == approval.Id, approval, new ReplaceOptions { IsUpsert = true }, ct);
+        {
+            var collection = Context.Collection<ApprovalRequest>();
+            var filter = Builders<ApprovalRequest>.Filter.Eq(x => x.QuacktionId, approval.QuacktionId);
+            var update = Builders<ApprovalRequest>.Update
+                .Set(x => x.OwnerAccountId, approval.OwnerAccountId)
+                .Set(x => x.ActionDigest, approval.ActionDigest)
+                .Set(x => x.Status, approval.Status)
+                .Set(x => x.ExpiresAt, approval.ExpiresAt)
+                .Set(x => x.ResolvedAt, approval.ResolvedAt)
+                .Set(x => x.Version, approval.Version)
+                .SetOnInsert(x => x.Id, approval.Id)
+                .SetOnInsert(x => x.CreatedAt, approval.CreatedAt);
+            try
+            {
+                await collection.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = true }, ct);
+            }
+            catch (MongoWriteException e) when (e.WriteError.Category == ServerErrorCategory.DuplicateKey)
+            {
+                // Concurrent upserts may race on the unique QuacktionId index. Retry as an update
+                // of the winner, preserving its existing Mongo _id.
+                await collection.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = false }, ct);
+            }
+        }
     }
 }

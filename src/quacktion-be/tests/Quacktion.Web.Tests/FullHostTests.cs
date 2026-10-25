@@ -29,7 +29,8 @@ public sealed class FullHostTests
                 {
                     ["Jwt:SigningKey"] = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)),
                     ["MongoDB:ConnectionString"] = uri,
-                    ["MongoDB:Database"] = database
+                    ["MongoDB:Database"] = database,
+                    ["Gemini:ApiKey"] = ""
                 }));
                 builder.ConfigureServices(s => s.AddSingleton<IAgentGateway, TestTaskGateway>());
             });
@@ -49,7 +50,7 @@ public sealed class FullHostTests
             var sessionId = (await creation.Content.ReadFromJsonAsync<JsonElement>(timeout.Token)).GetProperty("id").GetString();
             var start = await client.PostAsync($"/api/sessions/{sessionId}/start", null, timeout.Token);
             Assert.Equal(HttpStatusCode.ServiceUnavailable, start.StatusCode);
-            Assert.Contains("elevenlabs_agent_not_configured", await start.Content.ReadAsStringAsync(timeout.Token));
+            Assert.Contains("gemini_api_key_not_configured", await start.Content.ReadAsStringAsync(timeout.Token));
             var failed = await client.GetFromJsonAsync<JsonElement>($"/api/sessions/{sessionId}", timeout.Token);
             Assert.Equal("Failed", failed.GetProperty("status").GetString());
             using var scope = factory.Services.CreateScope();

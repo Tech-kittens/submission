@@ -1,4 +1,5 @@
 using System.Net.WebSockets;
+using System.Diagnostics;
 using System.Text.Json;
 using System.Threading.Channels;
 using Quacktion.App.DTOs;
@@ -11,7 +12,7 @@ namespace Quacktion.Web.WebSockets;
 
 public interface ISessionAudioWebSocketHandler
 {
-    Task HandleAsync(HttpContext context, string sessionId, string owner);
+    Task HandleAsync(HttpContext context, string sessionId, string owner, string? deviceId);
 }
 
 public sealed class SessionAudioWebSocketHandler(
@@ -24,11 +25,12 @@ public sealed class SessionAudioWebSocketHandler(
     ILogger<SessionAudioWebSocketHandler> logger
 ) : ISessionAudioWebSocketHandler
 {
+    private sealed record InputFrame(byte[] Data, long ReceivedAt);
     private const int MaxMessageBytes = 65536;
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private sealed record AudioStartControl(int Version, string Type, AudioNegotiation? Audio);
 
-    public async Task HandleAsync(HttpContext context, string sessionId, string owner)
+    public async Task HandleAsync(HttpContext context, string sessionId, string owner, string? deviceId)
     {
         using var socket = await context.WebSockets.AcceptWebSocketAsync("quacktion.audio.v1");
         using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, host.ApplicationStopping);
@@ -36,8 +38,7 @@ public sealed class SessionAudioWebSocketHandler(
         Session session;
         try
         {
-            session = await sessions.ConnectAccountDeviceSessionAsync(sessionId, owner, ct);
-            if (string.IsNullOrWhiteSpace(session.DeviceId)) throw new AppException(401, "session_device_missing");
+            session = await sessions.ConnectAccountSessionAsync(sessionId, owner, deviceId, ct);
         }
         catch (Exception e)
         {
@@ -49,8 +50,8 @@ public sealed class SessionAudioWebSocketHandler(
             return;
         }
 
-        var device = await devices.GetAsync(session.DeviceId!, ct);
-        if (device is null)
+        var device = deviceId is null ? null : await devices.GetAsync(deviceId, ct);
+        if (deviceId is not null && device is null)
         {
             await sessions.EndAsync(session.OwnerAccountId, session.Id, CancellationToken.None);
             return;
@@ -59,7 +60,7 @@ public sealed class SessionAudioWebSocketHandler(
         var outgoing = Channel.CreateBounded<OutboundFrame>(new BoundedChannelOptions(16)
         {
             FullMode = BoundedChannelFullMode.Wait,
-            SingleReader = true,
+            SingleReader = false,
             SingleWriter = false
         });
         using var audioConnection = audioConnections.Register(session.Id, async (data, token) =>
@@ -68,14 +69,17 @@ public sealed class SessionAudioWebSocketHandler(
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, ct);
             await outgoing.Writer.WriteAsync(frame, linked.Token);
             await frame.Sent!.Task.WaitAsync(linked.Token);
+            using var control = JsonDocument.Parse(data);
+            if (control.RootElement.TryGetProperty("type", out var type) && type.GetString() is "session.ended" or "session.failed" or "session.suspended")
+                lifetime.Cancel();
         });
-        var input = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(16)
+        var input = Channel.CreateBounded<InputFrame>(new BoundedChannelOptions(16)
         {
             FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true,
             SingleWriter = true
         });
-        var sender = SendLoopAsync(socket, outgoing.Reader, ct);
+        var sender = SendLoopAsync(socket, outgoing.Reader, logger, session.Id, ct);
         Task? providerSender = null;
         Task? providerReceiver = null;
         try
@@ -89,7 +93,9 @@ public sealed class SessionAudioWebSocketHandler(
             Guard.Input(start.Version == 1, "unsupported_protocol_version");
             Guard.Input(start.Type is "audio.start" or "AudioStart", "audio_start_required");
             Guard.Input(start.Audio is not null, "audio_format_required");
-            var providerSessionId = await audio.AttachAsync(device, session.Id, start.Audio!, ct);
+            var providerSessionId = device is null
+                ? await audio.AttachAsync(session.OwnerAccountId, session.Id, start.Audio!, ct)
+                : await audio.AttachAsync(device, session.Id, start.Audio!, ct);
             await outgoing.Writer.WriteAsync(ControlFrame(new { version = 1, type = "audio.ready", audio = start.Audio }), ct);
             providerSender = SendInputLoopAsync(providerSessionId, input.Reader, ct);
             providerReceiver = ReceiveProviderLoopAsync(providerSessionId, session, outgoing, ct);
@@ -100,7 +106,7 @@ public sealed class SessionAudioWebSocketHandler(
                 if (message.Type == WebSocketMessageType.Close) break;
                 if (message.Type == WebSocketMessageType.Binary)
                 {
-                    await input.Writer.WriteAsync(message.Data, ct);
+                    await input.Writer.WriteAsync(new(message.Data, Stopwatch.GetTimestamp()), ct);
                     continue;
                 }
 
@@ -123,48 +129,62 @@ public sealed class SessionAudioWebSocketHandler(
         {
             var code = e is AppException app ? app.Code : "audio_proxy_failed";
             logger.LogWarning("Session audio proxy failed {SessionId} {Code}", session.Id, code);
-            var failure = new OutboundFrame(JsonSerializer.SerializeToUtf8Bytes(new { version = 1, type = "error", code }, Json), WebSocketMessageType.Text, new(TaskCreationOptions.RunContinuationsAsynchronously));
             try
             {
-                await outgoing.Writer.WriteAsync(failure, CancellationToken.None);
-                await failure.Sent!.Task.WaitAsync(TimeSpan.FromSeconds(1));
+                using var failureTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                await sessions.SuspendAsync(session.OwnerAccountId, session.Id, session.AgentSessionId, failureTimeout.Token);
             }
             catch (Exception sendError) when (sendError is ChannelClosedException or TimeoutException or WebSocketException or OperationCanceledException) { }
         }
         finally
         {
+            using var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            try
+            {
+                var current = await sessionRepo.GetAsync(session.Id, cleanup.Token);
+                if (current?.Status == SessionStatus.Active)
+                    await sessions.SuspendAsync(session.OwnerAccountId, session.Id, session.AgentSessionId, cleanup.Token);
+            }
+            catch (Exception e) when (e is AppException or OperationCanceledException)
+            { logger.LogDebug("Session close raced with provider state {SessionId}", session.Id); }
             await lifetime.CancelAsync();
             input.Writer.TryComplete();
             outgoing.Writer.TryComplete();
             await ObserveAsync(providerSender);
             await ObserveAsync(providerReceiver);
-            try { await sender.WaitAsync(TimeSpan.FromSeconds(2)); }
-            catch (TimeoutException) { socket.Abort(); }
+            await ObserveAsync(sender);
 
-            var current = await sessions.GetAsync(session.OwnerAccountId, session.Id, CancellationToken.None);
-            if (current.Status == SessionStatus.Active)
-            {
-                try { await sessions.EndAsync(session.OwnerAccountId, session.Id, CancellationToken.None); }
-                catch (AppException e) { logger.LogDebug("Session close raced with provider state {SessionId} {Code}", session.Id, e.Code); }
-            }
             if (socket.State == WebSocketState.Open)
             {
-                try { await socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "session_ended", CancellationToken.None); }
-                catch (WebSocketException) { }
+                using var close = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                try { await socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "session_ended", close.Token); }
+                catch (Exception e) when (e is WebSocketException or OperationCanceledException) { }
             }
         }
 
-        async Task SendInputLoopAsync(string agentSessionId, ChannelReader<byte[]> frames, CancellationToken token)
+        async Task SendInputLoopAsync(string agentSessionId, ChannelReader<InputFrame> frames, CancellationToken token)
         {
+            var forwardedFrames = 0;
+            long forwardedBytes = 0;
             try
             {
                 await foreach (var frame in frames.ReadAllAsync(token))
-                    await audio.SendAsync(agentSessionId, frame, token);
+                {
+                    await audio.SendAsync(agentSessionId, frame.Data, token);
+                    forwardedFrames++;
+                    forwardedBytes += frame.Data.Length;
+                    if (logger.IsEnabled(LogLevel.Debug))
+                        logger.LogDebug("VoiceTiming {SessionId} {Stage} {ElapsedMs:F2}", session.Id,
+                            "audio_forward", Stopwatch.GetElapsedTime(frame.ReceivedAt).TotalMilliseconds);
+                    if (forwardedFrames == 1 || forwardedFrames % 100 == 0)
+                        logger.LogInformation("Forwarded microphone audio {SessionId} {FrameCount} {ByteCount}", session.Id, forwardedFrames, forwardedBytes);
+                }
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { }
             catch (Exception e)
             {
                 logger.LogWarning("Session audio input failed {SessionId} {ErrorType}", session.Id, e.GetType().Name);
+                await FailTransport("audio_input_failed");
                 lifetime.Cancel();
             }
         }
@@ -186,25 +206,35 @@ public sealed class SessionAudioWebSocketHandler(
                     if (item.Audio is { Length: > 0 } bytes)
                     {
                         Guard.Input(bytes.Length <= MaxMessageBytes, "provider_frame_too_large");
-                        await queue.Writer.WriteAsync(new(bytes, WebSocketMessageType.Binary), token);
+                        await queue.Writer.WriteAsync(new(bytes, WebSocketMessageType.Binary,
+                            PlaybackCancellation: item.PlaybackCancellation, TurnId: item.TurnId,
+                            ReceivedAt: item.ReceivedAt), token);
                     }
                     if (item.Type == "Disconnected")
                     {
-                        await sessions.FailAsync(activeSession.OwnerAccountId, activeSession.Id, "provider_disconnected", token);
-                        var failed = new OutboundFrame(JsonSerializer.SerializeToUtf8Bytes(new { version = 1, type = "session.failed", payload = new { sessionId = activeSession.Id, status = "Failed" } }, Json), WebSocketMessageType.Text, new(TaskCreationOptions.RunContinuationsAsynchronously));
-                        await queue.Writer.WriteAsync(failed, token);
-                        await failed.Sent!.Task.WaitAsync(token);
+                        await sessions.SuspendAsync(activeSession.OwnerAccountId, activeSession.Id, activeSession.AgentSessionId, token);
                         lifetime.Cancel();
                         return;
                     }
                 }
+                var current = await sessionRepo.GetAsync(activeSession.Id, token);
+                if (current?.Status == SessionStatus.Active)
+                    await sessions.SuspendAsync(activeSession.OwnerAccountId, activeSession.Id, activeSession.AgentSessionId, token);
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { }
             catch (Exception e)
             {
                 logger.LogWarning("Session audio output failed {SessionId} {ErrorType}", activeSession.Id, e.GetType().Name);
+                await FailTransport("audio_output_failed");
                 lifetime.Cancel();
             }
+        }
+
+        async Task FailTransport(string code)
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            try { await sessions.SuspendAsync(session.OwnerAccountId, session.Id, session.AgentSessionId, timeout.Token); }
+            catch (Exception e) when (e is AppException or OperationCanceledException) { }
         }
     }
 
@@ -233,13 +263,25 @@ public sealed class SessionAudioWebSocketHandler(
         return (result.MessageType, message.ToArray());
     }
 
-    private static async Task SendLoopAsync(WebSocket socket, ChannelReader<OutboundFrame> frames, CancellationToken ct)
+    private static async Task SendLoopAsync(WebSocket socket, ChannelReader<OutboundFrame> frames,
+        ILogger logger, string sessionId, CancellationToken ct)
     {
+        string? firstTurnSent = null;
         try
         {
             await foreach (var frame in frames.ReadAllAsync(ct))
             {
-                await socket.SendAsync(frame.Data, frame.Type, true, ct);
+                if (frame.PlaybackCancellation.IsCancellationRequested) continue;
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeout.CancelAfter(TimeSpan.FromSeconds(5));
+                await socket.SendAsync(frame.Data, frame.Type, true, timeout.Token);
+                if (frame.TurnId is { } turnId && turnId != firstTurnSent)
+                {
+                    firstTurnSent = turnId;
+                    if (logger.IsEnabled(LogLevel.Debug))
+                        logger.LogDebug("VoiceTiming {SessionId} {TurnId} {Stage} {ElapsedMs:F2}", sessionId, turnId,
+                            "provider_audio_to_client_send", frame.ReceivedAt == 0 ? -1 : Stopwatch.GetElapsedTime(frame.ReceivedAt).TotalMilliseconds);
+                }
                 frame.Sent?.TrySetResult();
             }
         }

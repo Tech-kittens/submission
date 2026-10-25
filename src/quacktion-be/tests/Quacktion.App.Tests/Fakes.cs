@@ -34,6 +34,7 @@ public class MemoryRepo<T> : IRepository<T> where T : Entity
                 || value is Device d && Values.Values.Cast<Device>().Any(x => x.DeviceIdentifier == d.DeviceIdentifier)
                 || value is TranscriptEntry t && Values.Values.Cast<TranscriptEntry>().Any(x => x.SessionId == t.SessionId && x.Source == t.Source && x.SourceEventId == t.SourceEventId))
                 throw new AppException(409, "duplicate_key");
+            if (Values.ContainsKey(value.Id)) throw new AppException(409, "duplicate_key");
             Values.Add(value.Id, Clone(value)); return Task.CompletedTask;
         }
     }
@@ -47,11 +48,11 @@ public sealed class Devices : MemoryRepo<Device>, IDeviceRepo;
 public sealed class Challenges : MemoryRepo<PairingChallenge>, IPairingChallengeRepo;
 public sealed class Sessions : MemoryRepo<Session>, ISessionRepo
 {
-    public Task<Session?> ConsumeOwnedConnectionAsync(string sessionId, string ownerId, DateTime now, CancellationToken ct)
+    public Task<Session?> ConsumeOwnedConnectionAsync(string sessionId, string ownerId, string? deviceId, DateTime now, CancellationToken ct)
     {
         lock (Gate)
         {
-            if (!Values.TryGetValue(sessionId, out var value) || value.OwnerAccountId != ownerId || value.DeviceId is null
+            if (!Values.TryGetValue(sessionId, out var value) || value.OwnerAccountId != ownerId || (deviceId is not null && value.DeviceId != deviceId)
                 || value.Status != SessionStatus.Ready || value.ConnectionCredentialExpiresAt <= now || value.ConnectionCredentialConsumedAt is not null)
                 return Task.FromResult<Session?>(null);
             value.Status = SessionStatus.Connecting; value.ConnectionCredentialConsumedAt = now; value.UpdatedAt = now; value.Version++;
@@ -59,8 +60,18 @@ public sealed class Sessions : MemoryRepo<Session>, ISessionRepo
         }
     }
 }
-public sealed class Transcripts : MemoryRepo<TranscriptEntry>, ITranscriptRepo;
+public sealed class Transcripts : MemoryRepo<TranscriptEntry>, ITranscriptRepo
+{
+    public Task<IReadOnlyList<TranscriptEntry>> RecentAsync(string sessionId, int limit, CancellationToken ct)
+    {
+        lock (Gate) return Task.FromResult<IReadOnlyList<TranscriptEntry>>(Values.Values.Where(x => x.SessionId == sessionId).OrderBy(x => x.CreatedAt).ThenBy(x => x.Id).TakeLast(limit).Select(Clone).ToList());
+    }
+}
 public sealed class Agents : MemoryRepo<Agent>, IAgentRepo;
+public sealed class McpConnections : MemoryRepo<UserMcpConnection>, IUserMcpConnectionRepo;
+public sealed class McpCredentials : MemoryRepo<McpCredential>, IMcpCredentialRepo;
+public sealed class McpTransactions : MemoryRepo<McpOAuthTransaction>, IMcpOAuthTransactionRepo;
+public sealed class McpAudits : MemoryRepo<McpExecutionAudit>, IMcpExecutionAuditRepo;
 public sealed class Actions : MemoryRepo<TaskAction>, IQuacktionRepo
 {
     public Task<TaskAction?> ClaimAsync(DateTime now, TimeSpan lease, CancellationToken ct)
@@ -102,10 +113,11 @@ public sealed class Issuer : ITokenIssuer { public (string Token, DateTime Expir
 public sealed class Voice : IConversationalAgentGateway
 {
     public bool Fail;
+    public Func<string, CancellationToken, Task>? OnEnd;
     public List<string> UserTexts { get; } = [];
     public Task<AgentSessionResult> StartSessionAsync(AgentSessionRequest request, CancellationToken ct) => Fail ? throw new AppException(503, "unavailable") : Task.FromResult(new AgentSessionResult("voice-" + request.SessionId));
     public Task SendUserTextAsync(string id, string text, CancellationToken ct) { UserTexts.Add(text); return Task.CompletedTask; }
-    public Task EndSessionAsync(string id, CancellationToken ct) => Task.CompletedTask;
+    public Task EndSessionAsync(string id, CancellationToken ct) => OnEnd?.Invoke(id, ct) ?? Task.CompletedTask;
 }
 public sealed class TaskAgent : IAgentOrchestrator
 {

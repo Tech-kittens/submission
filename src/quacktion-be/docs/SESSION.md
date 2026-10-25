@@ -1,14 +1,14 @@
 # ESP32-S3 session and audio handoff
 
-This document is the client implementation contract for session-based audio proxying. The client authenticates with the account bearer token, opens one session-scoped WebSocket, and exchanges audio with the backend. The backend owns account/session lifecycle and connects to ElevenLabs. Clients must never receive or store ElevenLabs credentials.
+This document is the client contract for assistant audio. A client authenticates with a device credential or account bearer token and exchanges audio with the backend over a session socket; firmware can also reuse its persistent device socket. The backend owns session lifecycle and connects to Gemini Live. Clients never receive Gemini Live credentials.
 
 Related backend references: [device protocol](device-protocol.md), [authentication and pairing](../AUTH.md), [audio simulator](../tools/Quacktion.AudioSimulator/Program.cs).
 
 ## Device provisioning
 
-An account owner creates and pairs a device through the account API. The session audio flow authenticates with the account bearer token; legacy `/ws/devices/{deviceId}` control connections still use the paired device credential. Do not put credentials in source control, logs, URLs, or normal control messages.
+An account owner creates and pairs a device through the account API. Firmware uses its paired device credential for both session creation and audio; apps use their account bearer token. Do not put credentials in source control, logs, URLs, or normal control messages.
 
-Session creation and its audio WebSocket both use the account access token with the `Bearer` authorization scheme. The backend selects the account's only paired device; multiple paired devices return `device_selection_required`.
+Session creation and its audio WebSocket accept either an account access token with the `Bearer` authorization scheme or a paired device credential with the `Device` scheme. Bearer sessions stream directly between the authenticated client and provider without a device. Device-authenticated sessions are associated with that paired device.
 
 ## Create a session
 
@@ -16,7 +16,7 @@ After the wake word and initial utterance have been captured, the firmware sends
 
 ```http
 POST /api/sessions/start
-Authorization: Bearer <accessToken>
+Authorization: Device <deviceCredential>
 Idempotency-Key: <unique-request-id>
 Content-Type: application/json
 ```
@@ -40,7 +40,9 @@ Successful response (`200`):
 }
 ```
 
-The bearer token must belong to the account that owns the paired device. `expiresInSeconds` is the time window in which to open the WebSocket. The session ID is an identifier, never an authentication secret. A retry with the same idempotency key while the session is still Ready returns the same session.
+Apps may use `Authorization: Bearer <accessToken>` instead. For firmware, the server derives the owner and device from the device credential, so no device ID is sent. **Device authentication is the supported design on the session socket.** No `connectionCredential` is returned and `Authorization: Session` is not supported. `expiresInSeconds` is the remaining window in which to connect. A retry while Ready returns the same session without extending its deadline.
+
+Expired Ready sessions fail with `connection_window_expired` and release the device. Maintenance runs every ten seconds; a new start also repairs an expired, terminal or missing session reservation immediately. Use a new idempotency key after expiry. The default connection window is 60 seconds.
 
 The service enforces one active session per device. An already consumed or started idempotency key returns a conflict; start a new session with a new key after the previous session finishes.
 
@@ -50,13 +52,13 @@ Connect to the exact `webSocketUrl` returned by the API. Convert the scheme only
 
 ```http
 GET /ws/sessions/<session-id>/audio
-Authorization: Bearer <accessToken>
+Authorization: Device <deviceCredential>
 Sec-WebSocket-Protocol: quacktion.audio.v1
 Connection: Upgrade
 Upgrade: websocket
 ```
 
-The backend verifies that the bearer token owns the session, atomically claims the pending connection, connects to ElevenLabs and waits for its conversation initialization metadata. Only then does it persist the provider conversation ID, transition the session to `Active`, and send:
+Authenticate the WebSocket with either the owning account's `Authorization: Bearer <accessToken>` or the matching device's `Authorization: Device <deviceCredential>`. The backend verifies the account or device owns the session, atomically claims the pending connection, connects to Gemini Live and waits for `setupComplete`. Only then does it persist the backend provider-connection ID, transition the session to `Active`, and send:
 
 ```json
 {
@@ -67,7 +69,7 @@ The backend verifies that the bearer token owns the session, atomically claims t
 }
 ```
 
-The next device message must be the audio format negotiation below. The backend gives the device no provider URL, signed URL, API key, or provider conversation ID.
+The next device message must be the audio format negotiation below. The backend gives the device no provider URL, signed URL, API key, or backend provider-connection ID.
 
 If initialization fails, the socket sends `session.start_failed` with the request ID, session ID and a stable error `code`, then closes. The session is persisted as Failed. Do not retry the same failed session; resolve the provider/configuration issue and create a new session.
 
@@ -87,13 +89,17 @@ Before sending audio, send one JSON text message:
 }
 ```
 
-The values above are examples only. Obtain the actual input and output codec, sample rate and channel count from the firmware/provider integration owner. The backend accepts only exact formats configured in both its input/output allowlists and accepted by the initialized ElevenLabs conversation. Allowlists are empty by default. The backend does not resample or transcode.
+Use the illustrated `pcm_16000`, 16000 Hz, mono formats with current hardware. Gemini receives PCM16 at 16 kHz; its 24 kHz output is low-pass filtered and resampled by the backend. Clients that support 24 kHz may instead negotiate output `pcm_24000`, 24000 Hz, mono. Both output formats are enabled by default.
 
-Wait for `audio.ready` before transmitting microphone data. Then send raw audio bytes as WebSocket **binary** messages. Do not wrap audio bytes in JSON or Base64 on the device; the backend Base64 encodes them into the documented ElevenLabs Conversational AI `user_audio_chunk` event. Provider `audio` event payloads are decoded by the backend and delivered to the device as binary messages.
+Wait for `audio.ready` before sending raw PCM16 little-endian **binary** frames, ideally 20–40 ms each. The backend Base64 encodes input inside Gemini `realtimeInput.audio` with `mimeType: "audio/pcm;rate=16000"`. It decodes Gemini `serverContent.modelTurn.parts[].inlineData` and streams raw PCM binary output at the negotiated rate.
 
 Use short frames for low latency and keep audio format/sample alignment valid. A single logical WebSocket message can be fragmented by the transport; the backend reassembles fragments. Maximum logical text or binary message size is 65,536 bytes. Input and output buffering is bounded to 16 messages, so firmware should not build an unbounded local queue when either connection is slow.
 
-An ElevenLabs interruption causes the backend to discard queued provider audio and send this text control; firmware should immediately clear audio that has not yet been played:
+The input queue waits for capacity without dropping frames or closing because it is full. There is no real-time pacing gate: buffered 40 ms frames can be uploaded at 3x, then live frames at real time. This confirms backend transport behavior, not Gemini's turn detection at accelerated speed; that still needs a real-provider/hardware trial. Provider send failures now surface as session failures instead of silently losing microphone audio.
+
+For the lowest setup latency outside meeting mode, reuse `/ws/devices/{deviceId}`: send `session.start` with `payload.promptFormat: "audio"`, wait for `session.started`, negotiate `audio.start`, wait for `audio.ready`, then send binary frames. `session.end` returns `session.ended` and leaves this device socket open for the next wake. See [meeting framing and coexistence](transcription-protocol.md).
+
+An Gemini Live interruption causes the backend to discard queued provider audio and send this text control; firmware should immediately clear audio that has not yet been played:
 
 ```json
 { "version": 1, "type": "audio.clear" }
@@ -109,7 +115,7 @@ End cleanly with:
 
 The backend closes the provider conversation, persists `Completed` (or `Failed` if shutdown fails), releases the device reservation and responds with `session.ended`. A signed-in web client can also end the session through `POST /api/sessions/{sessionId}/end`; the active device socket receives the same control notification.
 
-Provider disconnects produce `session.failed` and terminate the connection. A transport disconnect also closes the current session; the session permits one audio WebSocket connection during the configured connection window. Reconnect by creating a new session with a new idempotency key.
+An orderly provider close produces `session.ended`. Unexpected provider disconnects that exhaust reconnection produce `session.failed`; both terminate the session audio connection after sending the terminal control. A transport disconnect also closes the current session; the session permits one audio WebSocket connection during the configured connection window. Reconnect by creating a new session with a new idempotency key.
 
 WebSocket control messages are UTF-8 JSON with `version: 1`; audio uses binary messages only. The session audio endpoint supports `audio.start`, `session.end`, and server controls such as `session.started`, `audio.ready`, `audio.clear`, `session.start_failed`, `session.failed`, and `error`. It does not use application heartbeat messages; the WebSocket implementation's native ping/pong keepalive is used. Treat provider/network failures as session failures and surface a reconnect prompt to the user.
 
@@ -121,6 +127,6 @@ The repository includes a PCM16 WAV client that performs the HTTP start, WebSock
 dotnet run --project tools/Quacktion.AudioSimulator -- http://localhost:5188 <access-token> input.wav output.wav [input-codec] [output-codec] [output-rate] [output-channels]
 ```
 
-It supports PCM 16-bit WAV input/output only and does not resample. The account must own exactly one paired device. For live provider tests, configure `ElevenLabs__AgentId`, `ElevenLabs__ApiKey` for private agents, and exact `Audio__AllowedInputFormats__...` / `Audio__AllowedOutputFormats__...` values. Never log bearer tokens or audio contents.
+It supports PCM16 WAV input/output. Set `Gemini__ApiKey` server-side. Input must be mono 16 kHz. The backend supports 16 kHz resampled or 24 kHz native output. Never log credentials or meeting audio.
 
-The provider events follow the official [ElevenLabs Conversational AI WebSocket API](https://elevenlabs.io/docs/eleven-agents/api-reference/eleven-agents/websocket) and [client events](https://elevenlabs.io/docs/eleven-agents/customization/events/client-events). This is the conversational-agent endpoint, not the text-to-speech-only WebSocket API.
+The provider contract follows the [Gemini Live API wire reference](https://ai.google.dev/api/live). See [Gemini configuration, tools and deployment](GEMINI.md).
